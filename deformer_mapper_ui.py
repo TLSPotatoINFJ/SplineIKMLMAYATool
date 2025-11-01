@@ -1,22 +1,11 @@
 # deformer_mapper_ui.py
 # Maya 2023+ | PySide2
-# 功能：
-#  - Deformer Mapper (ONNX 推理)
-#  - Random Motion（随机位姿 + 属性随机器）
-#  - 样本导出：
-#       A) Per-file NPZ（逐样本一个 .npz）
-#       B) Sharded NPZ（推荐：每 N 条样本写一个分片 .npz，可压缩）
-#  - Attribute Randomizer：严格校验，仅真实存在的属性才加入（支持 transform/shape/完整plug）
-#  - 支持 double/float/int/bool/doubleAngle/doubleLinear/double3/enum
-#
-# 用法：
-#   import deformer_mapper_ui as dmui; dmui.show()
-
 from __future__ import annotations
 import os, json, traceback, random, math, time
 import numpy as np
 from PySide2 import QtWidgets, QtCore, QtGui
 import maya.cmds as cmds
+from maya import mel  # ✅ 修复：使用 maya.mel.eval
 
 # ====== onnxruntime（仅 Deformer Mapper 用；未装也可用 Random Motion） ======
 try:
@@ -63,16 +52,16 @@ def _vec60_to_5mats(vec60, flat_order="row"):
         mats.append(np.vstack([M34, np.array([0,0,0,1.0])]))
     return mats
 
-# ====== 分片写入器（推荐导出模式） ======
+# ====== 分片写入器（仅分片导出） ======
 class ShardedNPZWriter:
     """
-    把多条样本累积到内存，到达 shard_size 写出一个大 .npz 分片：
+    把多条样本累积到内存，到达 shard_size 写出一个 .npz 分片：
       - store_vec=True: 存 X_vec60:(60,K), Y_vec36:(36,K)
       - store_vec=False: 存 X_mats:(4,4,5,K), Y_mats:(4,4,3,K)
     """
     def __init__(self, out_dir, prefix="shard", shard_size=10000,
                  flat_order="row", store_vec=True, compress=True):
-        import numpy as _np  # 确保 numpy 可用
+        import numpy as _np
         self.np = _np
         self.out_dir = out_dir
         self.prefix = prefix
@@ -131,7 +120,6 @@ class ShardedNPZWriter:
         })
         self.buf_X.clear(); self.buf_Y.clear()
         self.shard_index += 1
-        # 持久化 manifest
         with open(self.manifest_path, "w", encoding="utf-8") as f:
             json.dump(self._manifest, f, ensure_ascii=False, indent=2)
 
@@ -182,26 +170,26 @@ class DeformerMapperSession:
             cmds.xform(node, ws=True, m=M.reshape(-1).tolist())
         return mats3
 
-# ====== Random Motion（含严格校验 Attribute Randomizer + 分片导出） ======
+# ====== Random Motion（严格校验属性随机器 + 仅分片导出 + Stop） ======
 class RandomMotionPanel(QtWidgets.QWidget):
     """
     - 随机位姿
-    - 属性随机器（严格校验，只加入真实存在且类型支持的属性；支持 transform/shape/完整 plug）
-    - 导出样本：Per-file NPZ 或 Sharded NPZ
-    - 与主窗体通过回调交互：获取当前 X/Y 样本（矩阵 & 向量）
+    - 属性随机器（严格校验）
+    - 仅分片导出（Sharded NPZ）
+    - Stop 按钮：可中断循环，安全关闭 writer
     """
     def __init__(self, parent=None, log_cb=None,
-                 get_nodes_cb=None, get_sample_cb=None, export_file_cb=None):
+                 get_nodes_cb=None, get_sample_cb=None):
         super().__init__(parent)
         self.target_object = None
         self.radius = 5.0
         self.center_pos = [0, 0, 0]
         self.iterations = 1
         self._log = log_cb or (lambda msg, level="info": None)
-        self._get_nodes_cb = get_nodes_cb          # 返回 (inputs[5], outputs[3])
-        self._get_sample_cb = get_sample_cb        # 返回 dict: {X_mats,Y_mats,X_vec60,Y_vec36,flatOrder}
-        self._export_file_cb = export_file_cb      # 逐样本：保存到路径
-        self._writer = None                        # 分片写入器
+        self._get_nodes_cb = get_nodes_cb
+        self._get_sample_cb = get_sample_cb
+        self._writer = None
+        self._stop_flag = False
         self._build_ui()
 
     # ---------- plug 解析 ----------
@@ -260,24 +248,20 @@ class RandomMotionPanel(QtWidgets.QWidget):
         self.update_center_btn.clicked.connect(self.update_center)
         layout.addWidget(self.update_center_btn)
 
-        # 导出设置
-        exp_box = QtWidgets.QGroupBox("Export Each Iteration (Sample X/Y)")
+        # 分片导出设置（仅分片，无单文件）
+        exp_box = QtWidgets.QGroupBox("Sharded Export (.npz)")
         gl = QtWidgets.QGridLayout(exp_box)
         self.export_chk = QtWidgets.QCheckBox("Enable"); self.export_chk.setChecked(False)
 
-        self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["Per-file NPZ", "Sharded NPZ (recommended)"])
-
         self.dir_edit = QtWidgets.QLineEdit()
         btn_dir = QtWidgets.QPushButton("Browse…"); btn_dir.clicked.connect(self._browse_dir)
-        self.prefix_edit = QtWidgets.QLineEdit("sample")  # per-file 前缀 或 分片前缀
+        self.prefix_edit = QtWidgets.QLineEdit("shard")
 
         self.shard_size_spin = QtWidgets.QSpinBox(); self.shard_size_spin.setRange(100, 10000000); self.shard_size_spin.setValue(10000)
         self.compress_chk = QtWidgets.QCheckBox("Compress NPZ"); self.compress_chk.setChecked(True)
         self.store_vec_chk = QtWidgets.QCheckBox("Store as vectors (X_vec/Y_vec)"); self.store_vec_chk.setChecked(True)
 
         gl.addWidget(self.export_chk, 0, 0)
-        gl.addWidget(QtWidgets.QLabel("Export Mode:"), 0, 1); gl.addWidget(self.mode_combo, 0, 2)
         gl.addWidget(QtWidgets.QLabel("Export dir:"), 1, 0); gl.addWidget(self.dir_edit, 1, 1); gl.addWidget(btn_dir, 1, 2)
         gl.addWidget(QtWidgets.QLabel("Prefix:"), 2, 0); gl.addWidget(self.prefix_edit, 2, 1, 1, 2)
         gl.addWidget(QtWidgets.QLabel("Shard Size:"), 3, 0); gl.addWidget(self.shard_size_spin, 3, 1)
@@ -310,11 +294,17 @@ class RandomMotionPanel(QtWidgets.QWidget):
         v.addWidget(self.attr_table)
         layout.addWidget(attr_box)
 
-        # 执行按钮与状态
-        self.random_btn = QtWidgets.QPushButton("Random Move")
+        # 执行按钮与状态（含 Stop）
+        btns = QtWidgets.QHBoxLayout()
+        self.random_btn = QtWidgets.QPushButton("Start Random Move")
         self.random_btn.setEnabled(False)
         self.random_btn.clicked.connect(self.random_move)
-        layout.addWidget(self.random_btn)
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._on_stop_clicked)
+        btns.addWidget(self.random_btn); btns.addWidget(self.stop_btn)
+        layout.addLayout(btns)
+
         self.status_label = QtWidgets.QLabel("No object selected. Select and click 'Select from Scene'.")
         layout.addWidget(self.status_label)
         layout.addStretch(1)
@@ -345,18 +335,19 @@ class RandomMotionPanel(QtWidgets.QWidget):
             self.status_label.setText(f"Selected: {self.target_object}")
             self._log(f"RandomMotion: Selected {self.target_object}")
         else:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Please select an object first.")
+            QtWidgets.QMessageBox.warning(self, "Warning", "Please select an object in the scene first.")
 
-    def update_radius(self, v): self.radius = v
-    def update_iterations(self, v): self.iterations = v
+    def update_radius(self, value): self.radius = value
+    def update_iterations(self, value): self.iterations = value
 
     def update_center(self):
         if self.target_object:
             try:
                 self.center_pos = cmds.xform(self.target_object, q=True, ws=True, t=True)
-                self.center_x.setValue(self.center_pos[0]); self.center_y.setValue(self.center_pos[1]); self.center_z.setValue(self.center_pos[2])
-                self.status_label.setText(f"Center updated: {self.center_pos}")
-                self._log(f"RandomMotion: Center -> {self.center_pos}")
+                self.center_x.setValue(self.center_pos[0])
+                self.center_y.setValue(self.center_pos[1])
+                self.center_z.setValue(self.center_pos[2])
+                self.status_label.setText(f"Center updated to: {self.center_pos}")
             except Exception as e:
                 cmds.warning(f"Error updating center: {e}")
                 self.status_label.setText(f"Error: {e}")
@@ -407,7 +398,7 @@ class RandomMotionPanel(QtWidgets.QWidget):
 
     def _add_from_channel_box(self):
         try:
-            ch_win = cmds.mel.eval('$tmp=$gChannelBoxName')
+            ch_win = mel.eval('$tmp=$gChannelBoxName')  # ✅ 修复：使用 maya.mel
             sels = cmds.channelBox(ch_win, q=True, sma=True) or []
             obj  = (cmds.channelBox(ch_win, q=True, mol=True) or [None])[0]
         except Exception:
@@ -464,7 +455,123 @@ class RandomMotionPanel(QtWidgets.QWidget):
             except Exception as e:
                 self._log(f"[Probe] {plug} error: {e}", "error")
 
-    # ---------- 属性赋值 ----------
+    # ---------- Stop ----------
+    def _on_stop_clicked(self):
+        self._stop_flag = True
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText("⛔ Stop requested... finishing current iteration.")
+        self._log("用户请求中断 Random Move。", "warn")
+
+    def _set_running_ui(self, running: bool):
+        # 运行时禁用可编辑控件，防误操作
+        for w in [self.object_line, self.radius_spin, self.iterations_spin,
+                  self.update_center_btn, self.export_chk, self.dir_edit,
+                  self.prefix_edit, self.shard_size_spin, self.compress_chk, self.store_vec_chk,
+                  self.attr_name_edit, self.attr_min_spin, self.attr_max_spin, self.attr_table]:
+            w.setEnabled(not running)
+        self.random_btn.setEnabled(not running)  # ✅ 修复：去掉 !running
+        self.stop_btn.setEnabled(running)
+        QtWidgets.QApplication.processEvents()
+
+    # ---------- 随机移动 & 仅分片导出（支持中断） ----------
+    def random_move(self):
+        if not self.target_object:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No target object selected."); return
+
+        self._stop_flag = False
+        self._set_running_ui(True)
+        self.status_label.setText("Running... (Sharded export). Click Stop to interrupt.")
+
+        try:
+            self.center_pos = [self.center_x.value(), self.center_y.value(), self.center_z.value()]
+            do_export = self.export_chk.isChecked()
+            export_dir = self.dir_edit.text().strip()
+            prefix = self.prefix_edit.text().strip() or "shard"
+            shard_size = self.shard_size_spin.value()
+            compress = self.compress_chk.isChecked()
+            store_vec = self.store_vec_chk.isChecked()
+
+            if do_export:
+                if not export_dir:
+                    QtWidgets.QMessageBox.warning(self, "Warning", "Please choose an export directory."); 
+                    self._set_running_ui(False); return
+                os.makedirs(export_dir, exist_ok=True)
+                self._writer = None  # 延迟到首次 sample 才创建，拿 flatOrder
+
+            rules = self._gather_attr_rules()
+            last_pos = None
+
+            for it in range(1, self.iterations + 1):
+                if self._stop_flag:
+                    self._log("🟠 中断信号收到，停止循环。", "warn")
+                    break
+
+                # 1) 随机位姿
+                r = self.radius * random.random()
+                theta = random.uniform(0, 2 * math.pi)
+                phi = random.uniform(0, math.pi)
+                x_off = r * math.sin(phi) * math.cos(theta)
+                y_off = r * math.sin(phi) * math.sin(theta)
+                z_off = r * math.cos(phi)
+                new_pos = [self.center_pos[0]+x_off, self.center_pos[1]+y_off, self.center_pos[2]+z_off]
+                new_rot = [random.uniform(-180,180), random.uniform(-180,180), random.uniform(-180,180)]
+                cmds.xform(self.target_object, ws=True, t=new_pos)
+                cmds.xform(self.target_object, ws=True, ro=new_rot)
+                last_pos = new_pos
+
+                # 2) 属性随机
+                if rules:
+                    self._apply_random_attrs(rules)
+
+                cmds.refresh()
+
+                # 3) 导出样本（仅分片）
+                if do_export and self._get_sample_cb:
+                    sample = self._get_sample_cb()
+                    if not sample:
+                        self._log("Export skipped: sample callback returned None.", "warn")
+                    else:
+                        flatOrder = sample.get("flatOrder","row")
+                        if self._writer is None:
+                            self._writer = ShardedNPZWriter(
+                                out_dir=export_dir,
+                                prefix=prefix,
+                                shard_size=shard_size,
+                                flat_order=flatOrder,
+                                store_vec=store_vec,
+                                compress=compress
+                            )
+                            self._log(f"[Shard] Writer created: size={shard_size}, compress={compress}, store_vec={store_vec}, flatOrder={flatOrder}")
+                        if store_vec:
+                            self._writer.append_vec(sample["X_vec60"], sample["Y_vec36"])
+                        else:
+                            self._writer.append_mats(sample["X_mats"], sample["Y_mats"])
+
+                # 每 10 次刷新一次 UI
+                if it % 10 == 0:
+                    self.status_label.setText(f"Iteration {it}/{self.iterations}")
+                    QtWidgets.QApplication.processEvents()
+
+            # 结束：关闭 writer
+            if self._writer is not None:
+                try:
+                    self._writer.close()
+                    self._log("[Shard] Writer closed.")
+                except Exception as e:
+                    self._log(f"[Shard] Close error: {e}", "error")
+                self._writer = None
+
+            self.status_label.setText(f"Completed or Stopped at {it}/{self.iterations}. Final pos: {last_pos}")
+            self._log(f"RandomMotion: Done/Stopped at {it}/{self.iterations}. Final pos: {last_pos}")
+
+        except Exception:
+            self._log("RandomMove failed:\n" + traceback.format_exc(), "error")
+
+        finally:
+            self._set_running_ui(False)
+            self._stop_flag = False
+            QtWidgets.QApplication.processEvents()
+
     def _apply_random_attrs(self, rules):
         for rule in rules:
             plug, vmin, vmax = rule["plug"], rule["min"], rule["max"]
@@ -497,113 +604,6 @@ class RandomMotionPanel(QtWidgets.QWidget):
             except Exception as e:
                 self._log(f"[Attr] Set failed {plug}: {e}", "error")
 
-    # ---------- 随机移动 & 导出 ----------
-    def random_move(self):
-        if not self.target_object:
-            QtWidgets.QMessageBox.warning(self, "Warning", "No target object selected."); return
-        try:
-            self.center_pos = [self.center_x.value(), self.center_y.value(), self.center_z.value()]
-            do_export = self.export_chk.isChecked()
-            export_dir = self.dir_edit.text().strip()
-            prefix = self.prefix_edit.text().strip() or "sample"
-            mode = self.mode_combo.currentText()
-            shard_size = self.shard_size_spin.value()
-            compress = self.compress_chk.isChecked()
-            store_vec = self.store_vec_chk.isChecked()
-
-            if do_export:
-                if not export_dir:
-                    QtWidgets.QMessageBox.warning(self, "Warning", "Please choose an export directory."); return
-                os.makedirs(export_dir, exist_ok=True)
-
-                # 若选择分片导出，创建 writer
-                if "Sharded" in mode:
-                    # flatOrder 从样本获取（每次 _get_sample_cb 会返回）
-                    self._writer = None  # 延迟到首次样本拿到 flatOrder 后再创建
-                else:
-                    self._writer = None  # per-file 模式不使用 writer
-
-            rules = self._gather_attr_rules()
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            last_pos = None
-
-            for it in range(1, self.iterations + 1):
-                # 1) 随机位姿
-                r = self.radius * random.random()
-                theta = random.uniform(0, 2 * math.pi)
-                phi = random.uniform(0, math.pi)
-                x_off = r * math.sin(phi) * math.cos(theta)
-                y_off = r * math.sin(phi) * math.sin(theta)
-                z_off = r * math.cos(phi)
-                new_pos = [self.center_pos[0]+x_off, self.center_pos[1]+y_off, self.center_pos[2]+z_off]
-                new_rot = [random.uniform(-180,180), random.uniform(-180,180), random.uniform(-180,180)]
-                cmds.xform(self.target_object, ws=True, t=new_pos)
-                cmds.xform(self.target_object, ws=True, ro=new_rot)
-                last_pos = new_pos
-
-                # 2) 属性随机
-                if rules:
-                    self._apply_random_attrs(rules)
-
-                cmds.refresh()
-
-                # 3) 导出样本
-                if do_export and self._get_sample_cb:
-                    sample = self._get_sample_cb()
-                    if not sample:
-                        self._log("Export skipped: sample callback returned None.", "warn")
-                    else:
-                        flatOrder = sample.get("flatOrder","row")
-                        if "Sharded" in mode:
-                            # 首次创建 writer（拿到 flatOrder）
-                            if self._writer is None:
-                                self._writer = ShardedNPZWriter(
-                                    out_dir=export_dir,
-                                    prefix=prefix,
-                                    shard_size=shard_size,
-                                    flat_order=flatOrder,
-                                    store_vec=store_vec,
-                                    compress=compress
-                                )
-                                self._log(f"[Shard] Writer created: size={shard_size}, compress={compress}, store_vec={store_vec}, flatOrder={flatOrder}")
-                            if store_vec:
-                                self._writer.append_vec(sample["X_vec60"], sample["Y_vec36"])
-                            else:
-                                self._writer.append_mats(sample["X_mats"], sample["Y_mats"])
-                        else:
-                            # Per-file
-                            if not self._export_file_cb:
-                                self._log("Per-file export callback not set.", "error")
-                            else:
-                                fname = f"{prefix}_{ts}_{it:06d}.npz"
-                                fpath = os.path.join(export_dir, fname)
-                                try:
-                                    self._export_file_cb_path(sample, fpath)
-                                    self._log(f"[Export] {fpath}")
-                                except Exception as e:
-                                    self._log(f"[Export Error] {e}", "error")
-
-            # 结束：关闭 writer
-            if self._writer is not None:
-                self._writer.close()
-                self._log("[Shard] Writer closed.")
-
-            self.status_label.setText(f"Completed {self.iterations} iterations. Final pos: {last_pos}")
-            self._log(f"RandomMotion: Done {self.iterations} iterations. Final pos: {last_pos}")
-
-        except Exception:
-            self._log("RandomMove failed:\n" + traceback.format_exc(), "error")
-
-    def _export_file_cb_path(self, sample_dict, fpath):
-        """把当前样本写成单个 .npz 文件（Per-file NPZ 模式）"""
-        flatOrder = sample_dict.get("flatOrder", "row")
-        X_mats = sample_dict["X_mats"]; Y_mats = sample_dict["Y_mats"]
-        X_vec60 = sample_dict["X_vec60"]; Y_vec36 = sample_dict["Y_vec36"]
-        np.savez(fpath,
-                 X_mats=X_mats, Y_mats=Y_mats,
-                 X_vec60=X_vec60, Y_vec36=Y_vec36,
-                 flatOrder=flatOrder)
-
     def showEvent(self, event):
         try:
             sel = cmds.ls(sl=True, transforms=True) or []
@@ -619,12 +619,12 @@ class RandomMotionPanel(QtWidgets.QWidget):
 
 # ====== 主窗口 ======
 class DeformerMapperUI(QtWidgets.QDialog):
-    WINDOW_TITLE = "Deformer Tools (Mapper + Random Motion + Sharded Export)"
+    WINDOW_TITLE = "Deformer Tools (Mapper + Random Motion + Sharded Export + Stop)"
 
     def __init__(self, parent=None):
         super().__init__(parent or get_maya_main_window())
         self.setWindowTitle(self.WINDOW_TITLE)
-        self.setMinimumWidth(920)
+        self.setMinimumWidth(960)
         self.session: DeformerMapperSession | None = None
         self._build_ui()
 
@@ -683,12 +683,11 @@ class DeformerMapperUI(QtWidgets.QDialog):
 
         self.tabs.addTab(deformer_tab, "Deformer Mapper")
 
-        # ---- Tab2: Random Motion （含分片导出）----
+        # ---- Tab2: Random Motion （仅分片导出 + Stop）----
         self.rand_tab = RandomMotionPanel(
             log_cb=self._log,
             get_nodes_cb=self._get_nodes_for_export,
-            get_sample_cb=self._get_current_sample,
-            export_file_cb=self._export_sample_to_path  # per-file 使用
+            get_sample_cb=self._get_current_sample
         )
         self.tabs.addTab(self.rand_tab, "Random Motion")
 
@@ -755,13 +754,13 @@ class DeformerMapperUI(QtWidgets.QDialog):
         use_gpu = self.use_gpu_chk.isChecked()
         return DeformerMapperSession(onnx_path, prep_path, use_gpu)
 
-    # ---- 导出/载入（按钮弹窗） ----
+    # ---- 导出/载入（调试用的单样本） ----
     def _on_export_sample_dialog(self):
         try:
             sample = self._get_current_sample()
             if not sample:
                 self._log("无法获取当前样本（请确认 5个输入/3个输出已填写）。", "warn"); return
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存 X/Y 样本为 .npz", "sample_xy.npz", "NumPy Zip (*.npz)")
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存 X/Y 样本为 .npz（调试用）", "sample_xy.npz", "NumPy Zip (*.npz)")
             if not path: self._log("已取消导出。"); return
             if not path.lower().endswith(".npz"): path += ".npz"
             self._export_sample_to_path_dict(sample, path)
@@ -774,7 +773,7 @@ class DeformerMapperUI(QtWidgets.QDialog):
             inputs, outputs = self._get_nodes_for_export()
             if not all(inputs) or not all(outputs):
                 self._log("输入/输出节点未填满，无法载入样本。", "warn"); return
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择样本 .npz", "", "NumPy Zip (*.npz)")
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择样本 .npz（调试用）", "", "NumPy Zip (*.npz)")
             if not path: self._log("已取消载入。"); return
 
             data = np.load(path, allow_pickle=True)
@@ -804,7 +803,7 @@ class DeformerMapperUI(QtWidgets.QDialog):
         except Exception:
             self._log("载入失败：\n" + traceback.format_exc(), "error")
 
-    # ---- Random Motion 回调：获取节点 / 当前样本 / per-file 保存 ----
+    # ---- Random Motion 回调：获取节点 / 当前样本 ----
     def _get_nodes_for_export(self):
         inputs  = [e.text().strip() for e in self.inputs_edits]
         outputs = [e.text().strip() for e in self.outputs_edits]
@@ -831,12 +830,6 @@ class DeformerMapperUI(QtWidgets.QDialog):
             "X_vec60": X_vec60, "Y_vec36": Y_vec36,
             "flatOrder": flatOrder
         }
-
-    def _export_sample_to_path(self, inputs, outputs, path):
-        """保留兼容（未使用）；推荐直接用 _export_sample_to_path_dict"""
-        sample = self._get_current_sample()
-        if not sample: raise RuntimeError("无法获取当前样本")
-        self._export_sample_to_path_dict(sample, path)
 
     def _export_sample_to_path_dict(self, sample_dict, path):
         flatOrder = sample_dict.get("flatOrder", "row")
