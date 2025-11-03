@@ -1,11 +1,13 @@
 # deformer_mapper_ui.py
-# Maya 2023+ | PySide2
+# Maya 2023+ | PySide2 | Python 3.9
 from __future__ import annotations
 import os, json, traceback, random, math, time
 import numpy as np
+import numpy.linalg as la
+from typing import Optional, List, Dict
 from PySide2 import QtWidgets, QtCore, QtGui
 import maya.cmds as cmds
-from maya import mel  # ✅ 修复：使用 maya.mel.eval
+from maya import mel  # maya.mel.eval
 
 # ====== onnxruntime（仅 Deformer Mapper 用；未装也可用 Random Motion） ======
 try:
@@ -15,7 +17,9 @@ except Exception as _e:
     _ORT_OK = False
     _ORT_ERR = _e
 
-# ====== 公用 ======
+# =========================
+# 公用：UI/矩阵/打包/本地↔世界
+# =========================
 def get_maya_main_window():
     import maya.OpenMayaUI as omui
     from shiboken2 import wrapInstance
@@ -26,33 +30,70 @@ def _get_world_matrix(node: str) -> np.ndarray:
     m = cmds.xform(node, q=True, ws=True, m=True)
     return np.array(m, dtype=np.float64).reshape(4, 4)
 
-def _pack_input_60(mats5, flat_order="row"):
-    vecs = []
-    for M in mats5:
-        M34 = M[:3, :4]
-        v = M34.reshape(-1) if flat_order == "row" else M34.T.reshape(-1)
-        vecs.append(v.astype(np.float64))
-    return np.concatenate(vecs, axis=0)
+def _project_mat_svd(M34: np.ndarray) -> np.ndarray:
+    """对 3x4 的前部进行 SVD，使旋转正交，缩放≈1。"""
+    R3 = M34[:, :3]
+    U, _, Vt = la.svd(R3, full_matrices=False)
+    R = U @ Vt
+    # 防止反射
+    if np.linalg.det(R) < 0:
+        U[:, 2] *= -1.0
+        R = U @ Vt
+    return np.hstack([R, M34[:, 3:4]])
 
-def _unpack_output_36_to_3mats(v36, flat_order="row"):
-    assert v36.shape[-1] == 36
+def _to_local_space(mats_world: List[np.ndarray]) -> List[np.ndarray]:
+    """把一组世界矩阵转到以第一项为参考的本地空间，本地= W @ W1_inv。"""
+    W1 = mats_world[0]
+    W1_inv = la.inv(W1)
+    return [M @ W1_inv for M in mats_world]
+
+def _from_local_to_world(mats_local: List[np.ndarray], W1_world: np.ndarray) -> List[np.ndarray]:
+    """把本地矩阵（以参考物体为原点）还原到世界，世界= L @ W1。"""
+    return [L @ W1_world for L in mats_local]
+
+def _pack_input_60(mats5_local: List[np.ndarray], flat_order="row") -> np.ndarray:
+    """5 个 4x4，本地空间，打成 60 维（去掉最后一行）。"""
+    vecs = []
+    for M in mats5_local:
+        M34 = M[:3, :4]
+        v = (M34.reshape(-1) if flat_order == "row" else M34.T.reshape(-1))
+        vecs.append(v.astype(np.float64))
+    return np.concatenate(vecs, axis=0)  # (60,)
+
+def _pack_3mats_to_vec36(mats3_local: List[np.ndarray], flat_order="row") -> np.ndarray:
+    out = []
+    for M in mats3_local:
+        M34 = M[:3, :4]
+        out.extend(M34.reshape(-1) if flat_order == "row" else M34.T.reshape(-1))
+    return np.asarray(out, dtype=np.float64)  # (36,)
+
+def _unpack_output_36_to_3mats(v36: np.ndarray, flat_order="row") -> List[np.ndarray]:
+    v36 = v36.reshape(-1)
+    assert v36.shape[0] == 36
     mats = []
     for k in range(3):
         seg = v36[k*12:(k+1)*12]
-        M34 = seg.reshape(3,4) if flat_order == "row" else seg.reshape(4,3).T
-        mats.append(np.vstack([M34, np.array([0,0,0,1.0])]))
+        M34 = (seg.reshape(3,4) if flat_order == "row" else seg.reshape(4,3).T)
+        M = np.eye(4, dtype=np.float64)
+        M[:3, :4] = M34
+        mats.append(M)
     return mats
 
-def _vec60_to_5mats(vec60, flat_order="row"):
-    assert vec60.shape[-1] == 60
+def _vec60_to_5mats(vec60: np.ndarray, flat_order="row") -> List[np.ndarray]:
+    vec60 = vec60.reshape(-1)
+    assert vec60.shape[0] == 60
     mats = []
     for k in range(5):
         seg = vec60[k*12:(k+1)*12]
-        M34 = seg.reshape(3,4) if flat_order == "row" else seg.reshape(4,3).T
-        mats.append(np.vstack([M34, np.array([0,0,0,1.0])]))
+        M34 = (seg.reshape(3,4) if flat_order == "row" else seg.reshape(4,3).T)
+        M = np.eye(4, dtype=np.float64)
+        M[:3, :4] = M34
+        mats.append(M)
     return mats
 
-# ====== 分片写入器（仅分片导出） ======
+# =========================
+# 分片写入器（仅分片导出）
+# =========================
 class ShardedNPZWriter:
     """
     把多条样本累积到内存，到达 shard_size 写出一个 .npz 分片：
@@ -61,8 +102,7 @@ class ShardedNPZWriter:
     """
     def __init__(self, out_dir, prefix="shard", shard_size=10000,
                  flat_order="row", store_vec=True, compress=True):
-        import numpy as _np
-        self.np = _np
+        self.np = np
         self.out_dir = out_dir
         self.prefix = prefix
         self.shard_size = int(max(1, shard_size))
@@ -110,8 +150,8 @@ class ShardedNPZWriter:
             Y_all = self.np.stack(self.buf_Y, axis=1)  # (36,K)
             save(fpath, X_vec60=X_all, Y_vec36=Y_all, flatOrder=self.flat_order)
         else:
-            X_all = self.np.stack(self.buf_X, axis=2)  # (4,4,5,K)
-            Y_all = self.np.stack(self.buf_Y, axis=2)  # (4,4,3,K)
+            X_all = self.np.stack(self.buf_X, axis=3)  # (4,4,5,K)
+            Y_all = self.np.stack(self.buf_Y, axis=3)  # (4,4,3,K)
             save(fpath, X_mats=X_all, Y_mats=Y_all, flatOrder=self.flat_order)
         self._manifest["shards"].append({
             "file": fname,
@@ -126,7 +166,9 @@ class ShardedNPZWriter:
     def close(self):
         self._flush()
 
-# ====== Deformer Mapper（ONNX 推理） ======
+# =========================
+# Deformer Mapper（ONNX 推理 - 本地→预测→世界）
+# =========================
 class DeformerMapperSession:
     def __init__(self, onnx_path: str, prep_json: str, use_gpu=True):
         if not _ORT_OK:
@@ -144,25 +186,46 @@ class DeformerMapperSession:
 
         with open(prep_json, "r", encoding="utf-8") as f:
             prep = json.load(f)
-        self.muX  = np.array(prep["muX"], dtype=np.float64).reshape(-1)
-        self.sigX = np.array(prep["sigX"], dtype=np.float64).reshape(-1)
+        self.muX  = np.array(prep["muX"], dtype=np.float64).reshape(60)
+        self.sigX = np.array(prep["sigX"], dtype=np.float64).reshape(60)
         self.flat_order = prep.get("flatOrder", "row")
-        if self.muX.shape[0] != 60 or self.sigX.shape[0] != 60:
-            raise ValueError("prep.json 中 muX/sigX 维度必须为 60。")
+        # 兼容双向标准化：若有 muY/sigY 也加载备用（本端推理不需要）
+        self.muY  = np.array(prep.get("muY",  np.zeros(36)), dtype=np.float64).reshape(36)
+        self.sigY = np.array(prep.get("sigY", np.ones(36)*1.0), dtype=np.float64).reshape(36)
 
         self.in_name  = self.sess.get_inputs()[0].name
         self.out_name = self.sess.get_outputs()[0].name
 
-    def predict_from_nodes(self, input_nodes):
+    def predict_from_nodes(self, input_nodes: List[str], project_svd=True) -> List[np.ndarray]:
         if len(input_nodes) != 5:
             raise ValueError("需要 5 个输入节点。")
-        mats5 = [_get_world_matrix(n) for n in input_nodes]
-        x60 = _pack_input_60(mats5, self.flat_order)
-        xn = (x60 - self.muX) / self.sigX
-        y = self.sess.run([self.out_name], {self.in_name: xn.reshape(1,-1).astype(np.float32)})[0]
-        return _unpack_output_36_to_3mats(y.reshape(-1).astype(np.float64), self.flat_order)
 
-    def apply_to_nodes(self, input_nodes, output_nodes):
+        # 世界 → 本地（以 In1 为基准）
+        mats5_world = [_get_world_matrix(n) for n in input_nodes]
+        mats5_local = _to_local_space(mats5_world)
+
+        # 打包“本地”输入
+        x60 = _pack_input_60(mats5_local, self.flat_order)
+        xn  = (x60 - self.muX) / (self.sigX + 1e-12)
+
+        # 推理得到“本地”输出
+        y_std = self.sess.run([self.out_name], {self.in_name: xn.reshape(1, -1).astype(np.float32)})[0]
+        v36   = y_std.reshape(-1).astype(np.float64)
+        mats3_local = _unpack_output_36_to_3mats(v36, self.flat_order)
+
+        # 可选：对“本地”输出做 SVD 投影（把旋转正交、缩放≈1）
+        if project_svd:
+            for i in range(3):
+                M34 = mats3_local[i][:3, :4]
+                M34p = _project_mat_svd(M34)
+                mats3_local[i] = np.vstack([M34p, np.array([0,0,0,1.0])])
+
+        # 还原到世界：使用“当前” In1 世界矩阵
+        W1_now = mats5_world[0]
+        mats3_world = _from_local_to_world(mats3_local, W1_now)
+        return mats3_world
+
+    def apply_to_nodes(self, input_nodes: List[str], output_nodes: List[str]) -> List[np.ndarray]:
         if len(output_nodes) != 3:
             raise ValueError("需要 3 个输出节点。")
         mats3 = self.predict_from_nodes(input_nodes)
@@ -170,13 +233,16 @@ class DeformerMapperSession:
             cmds.xform(node, ws=True, m=M.reshape(-1).tolist())
         return mats3
 
-# ====== Random Motion（严格校验属性随机器 + 仅分片导出 + Stop） ======
+# =========================
+# Random Motion（属性随机器 + 仅分片导出 + Stop）
+# =========================
 class RandomMotionPanel(QtWidgets.QWidget):
     """
     - 随机位姿
     - 属性随机器（严格校验）
     - 仅分片导出（Sharded NPZ）
     - Stop 按钮：可中断循环，安全关闭 writer
+    - 导出的样本为“本地空间（相对 In1）”
     """
     def __init__(self, parent=None, log_cb=None,
                  get_nodes_cb=None, get_sample_cb=None):
@@ -188,12 +254,12 @@ class RandomMotionPanel(QtWidgets.QWidget):
         self._log = log_cb or (lambda msg, level="info": None)
         self._get_nodes_cb = get_nodes_cb
         self._get_sample_cb = get_sample_cb
-        self._writer = None
+        self._writer: Optional[ShardedNPZWriter] = None
         self._stop_flag = False
         self._build_ui()
 
     # ---------- plug 解析 ----------
-    def _resolve_plug(self, node: str, attr: str) -> str | None:
+    def _resolve_plug(self, node: str, attr: str) -> Optional[str]:
         attr = attr.strip()
         if not node and "." in attr and cmds.objExists(attr):
             return attr  # 已是完整 plug
@@ -248,7 +314,7 @@ class RandomMotionPanel(QtWidgets.QWidget):
         self.update_center_btn.clicked.connect(self.update_center)
         layout.addWidget(self.update_center_btn)
 
-        # 分片导出设置（仅分片，无单文件）
+        # 分片导出设置（仅分片）
         exp_box = QtWidgets.QGroupBox("Sharded Export (.npz)")
         gl = QtWidgets.QGridLayout(exp_box)
         self.export_chk = QtWidgets.QCheckBox("Enable"); self.export_chk.setChecked(False)
@@ -398,7 +464,7 @@ class RandomMotionPanel(QtWidgets.QWidget):
 
     def _add_from_channel_box(self):
         try:
-            ch_win = mel.eval('$tmp=$gChannelBoxName')  # ✅ 修复：使用 maya.mel
+            ch_win = mel.eval('$tmp=$gChannelBoxName')
             sels = cmds.channelBox(ch_win, q=True, sma=True) or []
             obj  = (cmds.channelBox(ch_win, q=True, mol=True) or [None])[0]
         except Exception:
@@ -459,17 +525,16 @@ class RandomMotionPanel(QtWidgets.QWidget):
     def _on_stop_clicked(self):
         self._stop_flag = True
         self.stop_btn.setEnabled(False)
-        self.status_label.setText("⛔ Stop requested... finishing current iteration.")
+        self.status_label.setText("Stop requested... finishing current iteration.")
         self._log("用户请求中断 Random Move。", "warn")
 
     def _set_running_ui(self, running: bool):
-        # 运行时禁用可编辑控件，防误操作
         for w in [self.object_line, self.radius_spin, self.iterations_spin,
                   self.update_center_btn, self.export_chk, self.dir_edit,
                   self.prefix_edit, self.shard_size_spin, self.compress_chk, self.store_vec_chk,
                   self.attr_name_edit, self.attr_min_spin, self.attr_max_spin, self.attr_table]:
             w.setEnabled(not running)
-        self.random_btn.setEnabled(not running)  # ✅ 修复：去掉 !running
+        self.random_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
         QtWidgets.QApplication.processEvents()
 
@@ -493,17 +558,17 @@ class RandomMotionPanel(QtWidgets.QWidget):
 
             if do_export:
                 if not export_dir:
-                    QtWidgets.QMessageBox.warning(self, "Warning", "Please choose an export directory."); 
+                    QtWidgets.QMessageBox.warning(self, "Warning", "Please choose an export directory.")
                     self._set_running_ui(False); return
                 os.makedirs(export_dir, exist_ok=True)
-                self._writer = None  # 延迟到首次 sample 才创建，拿 flatOrder
+                self._writer = None  # 延迟到首次 sample 才创建
 
             rules = self._gather_attr_rules()
             last_pos = None
 
             for it in range(1, self.iterations + 1):
                 if self._stop_flag:
-                    self._log("🟠 中断信号收到，停止循环。", "warn")
+                    self._log("中断信号收到，停止循环。", "warn")
                     break
 
                 # 1) 随机位姿
@@ -525,7 +590,7 @@ class RandomMotionPanel(QtWidgets.QWidget):
 
                 cmds.refresh()
 
-                # 3) 导出样本（仅分片）
+                # 3) 导出样本（仅分片），导出“本地空间”样本
                 if do_export and self._get_sample_cb:
                     sample = self._get_sample_cb()
                     if not sample:
@@ -547,7 +612,7 @@ class RandomMotionPanel(QtWidgets.QWidget):
                         else:
                             self._writer.append_mats(sample["X_mats"], sample["Y_mats"])
 
-                # 每 10 次刷新一次 UI
+                # UI 刷新
                 if it % 10 == 0:
                     self.status_label.setText(f"Iteration {it}/{self.iterations}")
                     QtWidgets.QApplication.processEvents()
@@ -617,7 +682,9 @@ class RandomMotionPanel(QtWidgets.QWidget):
             pass
         super().showEvent(event)
 
-# ====== 主窗口 ======
+# =========================
+# 主窗口
+# =========================
 class DeformerMapperUI(QtWidgets.QDialog):
     WINDOW_TITLE = "Deformer Tools (Mapper + Random Motion + Sharded Export + Stop)"
 
@@ -625,10 +692,9 @@ class DeformerMapperUI(QtWidgets.QDialog):
         super().__init__(parent or get_maya_main_window())
         self.setWindowTitle(self.WINDOW_TITLE)
         self.setMinimumWidth(960)
-        self.session: DeformerMapperSession | None = None
+        self.session = None  # type: Optional[DeformerMapperSession]
         self._build_ui()
 
-    # 日志
     def _log(self, msg: str, level: str = "info"):
         prefix = {"info":"[INFO] ", "warn":"[WARN] ", "error":"[ERROR] "}.get(level, "[INFO] ")
         self.log_edit.appendPlainText(prefix + msg)
@@ -687,7 +753,7 @@ class DeformerMapperUI(QtWidgets.QDialog):
         self.rand_tab = RandomMotionPanel(
             log_cb=self._log,
             get_nodes_cb=self._get_nodes_for_export,
-            get_sample_cb=self._get_current_sample
+            get_sample_cb=self._get_current_sample  # 本地空间样本
         )
         self.tabs.addTab(self.rand_tab, "Random Motion")
 
@@ -726,7 +792,7 @@ class DeformerMapperUI(QtWidgets.QDialog):
     def _on_reload(self):
         try:
             self.session = self._build_session()
-            self._log("模型加载成功 ✅")
+            self._log("模型加载成功")
         except Exception as e:
             self._log("模型加载失败：\n" + "".join(traceback.format_exception_only(type(e), e)), "error")
 
@@ -754,17 +820,19 @@ class DeformerMapperUI(QtWidgets.QDialog):
         use_gpu = self.use_gpu_chk.isChecked()
         return DeformerMapperSession(onnx_path, prep_path, use_gpu)
 
-    # ---- 导出/载入（调试用的单样本） ----
+    # ---- 导出/载入（调试用的单样本；本地空间） ----
     def _on_export_sample_dialog(self):
         try:
             sample = self._get_current_sample()
             if not sample:
                 self._log("无法获取当前样本（请确认 5个输入/3个输出已填写）。", "warn"); return
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存 X/Y 样本为 .npz（调试用）", "sample_xy.npz", "NumPy Zip (*.npz)")
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存 X/Y 样本为 .npz（调试用）",
+                                                            f"sample_xy_{ts}.npz", "NumPy Zip (*.npz)")
             if not path: self._log("已取消导出。"); return
             if not path.lower().endswith(".npz"): path += ".npz"
             self._export_sample_to_path_dict(sample, path)
-            self._log(f"✅ 已导出样本：{path}")
+            self._log(f"已导出样本（本地空间）：{path}")
         except Exception:
             self._log("导出失败：\n" + traceback.format_exc(), "error")
 
@@ -779,59 +847,69 @@ class DeformerMapperUI(QtWidgets.QDialog):
             data = np.load(path, allow_pickle=True)
             flat_order = str(data["flatOrder"]) if "flatOrder" in data else "row"
 
-            # X
+            # 读取“本地”矩阵
             if "X_mats" in data:
-                X_mats = data["X_mats"]; mats5 = [X_mats[:,:,i] for i in range(5)]
+                Xm = np.array(data["X_mats"]); mats5_local = [Xm[:,:,i] for i in range(5)]
             elif "X_vec60" in data:
-                mats5 = _vec60_to_5mats(np.array(data["X_vec60"]).reshape(-1), flat_order)
+                mats5_local = _vec60_to_5mats(np.array(data["X_vec60"]).reshape(-1), flat_order)
             else:
                 raise ValueError("样本中没有 X。")
 
-            # Y
             if "Y_mats" in data:
-                Y_mats = data["Y_mats"]; mats3 = [Y_mats[:,:,i] for i in range(3)]
+                Ym = np.array(data["Y_mats"]); mats3_local = [Ym[:,:,i] for i in range(3)]
             elif "Y_vec36" in data:
-                mats3 = _unpack_output_36_to_3mats(np.array(data["Y_vec36"]).reshape(-1), flat_order)
+                mats3_local = _unpack_output_36_to_3mats(np.array(data["Y_vec36"]).reshape(-1), flat_order)
             else:
                 raise ValueError("样本中没有 Y。")
 
-            for node, M in zip(inputs, mats5):
+            # 用“当前” In1 世界矩阵还原到世界
+            W1_now = _get_world_matrix(inputs[0])
+            mats5_world = _from_local_to_world(mats5_local, W1_now)
+            mats3_world = _from_local_to_world(mats3_local, W1_now)
+
+            for node, M in zip(inputs, mats5_world):
                 cmds.xform(node, ws=True, m=M.reshape(-1).tolist())
-            for node, M in zip(outputs, mats3):
+            for node, M in zip(outputs, mats3_world):
                 cmds.xform(node, ws=True, m=M.reshape(-1).tolist())
-            self._log(f"✅ 已载入样本并写回：{path}")
+            self._log(f"已载入样本并写回（按当前 In1 为基准）：{path}")
         except Exception:
             self._log("载入失败：\n" + traceback.format_exc(), "error")
 
-    # ---- Random Motion 回调：获取节点 / 当前样本 ----
+    # ---- Random Motion 回调：获取节点 / 当前“本地空间”样本 ----
     def _get_nodes_for_export(self):
         inputs  = [e.text().strip() for e in self.inputs_edits]
         outputs = [e.text().strip() for e in self.outputs_edits]
         return inputs, outputs
 
     def _get_current_sample(self):
-        """返回 dict：{X_mats(4,4,5), Y_mats(4,4,3), X_vec60(60,), Y_vec36(36,), flatOrder}"""
+        """
+        返回以 In1 为参考的“本地空间”样本：
+        {X_mats(4,4,5), Y_mats(4,4,3), X_vec60(60,), Y_vec36(36,), flatOrder}
+        """
         inputs, outputs = self._get_nodes_for_export()
         if not (len(inputs)==5 and len(outputs)==3 and all(inputs) and all(outputs)):
             return None
-        mats5 = [_get_world_matrix(n) for n in inputs]
-        mats3 = [_get_world_matrix(n) for n in outputs]
-        X_mats = np.stack(mats5, axis=-1)   # (4,4,5)
-        Y_mats = np.stack(mats3, axis=-1)   # (4,4,3)
+
+        # 世界 → 本地
+        mats5_world = [_get_world_matrix(n) for n in inputs]
+        mats3_world = [_get_world_matrix(n) for n in outputs]
+        mats5_local = _to_local_space(mats5_world)                        # 5
+        mats3_local = _to_local_space([mats5_world[0]] + mats3_world)[1:] # 3
+
+        X_mats = np.stack(mats5_local, axis=-1)  # (4,4,5)
+        Y_mats = np.stack(mats3_local, axis=-1)  # (4,4,3)
+
         flatOrder = "row"
-        X_vec60 = _pack_input_60(mats5, flatOrder)
-        Y_vec36 = []
-        for M in mats3:
-            M34 = M[:3, :4]
-            Y_vec36.extend(M34.reshape(-1) if flatOrder == "row" else M34.T.reshape(-1))
-        Y_vec36 = np.asarray(Y_vec36, dtype=np.float64)
+        X_vec60 = _pack_input_60(mats5_local, flatOrder)
+        Y_vec36 = _pack_3mats_to_vec36(mats3_local, flatOrder)
+
         return {
             "X_mats": X_mats, "Y_mats": Y_mats,
             "X_vec60": X_vec60, "Y_vec36": Y_vec36,
             "flatOrder": flatOrder
         }
 
-    def _export_sample_to_path_dict(self, sample_dict, path):
+    def _export_sample_to_path_dict(self, sample_dict: Dict, path: str):
         flatOrder = sample_dict.get("flatOrder", "row")
         X_mats = sample_dict["X_mats"]; Y_mats = sample_dict["Y_mats"]
         X_vec60 = sample_dict["X_vec60"]; Y_vec36 = sample_dict["Y_vec36"]
