@@ -1,0 +1,410 @@
+function train_deformer_mapper_from_shards(rootDir, prefix, outDir)
+% TLS Deformer Mapper Trainer (36-dim Mat3x4) - GPU Ready & Vectorized Ortho/Scale
+
+arguments
+    rootDir (1,1) string
+    prefix  (1,1) string
+    outDir  (1,1) string
+end
+if ~isfolder(outDir), mkdir(outDir); end
+
+% ---------------- Device helper ----------------
+useGPU = canUseGPU;
+dev = @(x) (useGPU ? gpuArray(x) : x);   % put on GPU if available
+toSingle = @(x) single(x);
+
+% ---------------- Manifest ----------------
+manifestPath = fullfile(rootDir, prefix + "_manifest.json");
+if ~isfile(manifestPath)
+    files = dir(fullfile(rootDir, prefix + "_*.npz"));
+    assert(~isempty(files), "No shards found with prefix '%s' in %s", prefix, rootDir);
+    shardsList = struct('file', {}, 'num_samples', {}, 'start_idx', {});
+    total = 0; flatOrder = "row"; store_vec = true;
+    for i = 1:numel(files)
+        fpath = fullfile(files(i).folder, files(i).name);
+        data  = py.numpy.load(fpath, pyargs("allow_pickle",true));
+        if ~isempty(data.get('X_vec60'))
+            Xpy = data.get('X_vec60'); sh = cell(Xpy.shape); K = double(sh{2}); store_vec = true;
+        else
+            XmPy = data.get('X_mats');  sh = cell(XmPy.shape); K = double(sh{4}); store_vec = false;
+        end
+        if ~isempty(data.get('flatOrder'))
+            flatOrder = string(char(data.get('flatOrder')));
+        end
+        shardsList(end+1).file = files(i).name; %#ok<AGROW>
+        shardsList(end).num_samples = K;
+        shardsList(end).start_idx   = total;
+        total = total + K;
+    end
+    man.prefix=char(prefix);
+    man.flatOrder=char(flatOrder);
+    man.store_vec=store_vec;
+    man.shards=shardsList;
+    fid=fopen(manifestPath,'w'); fwrite(fid,jsonencode(man)); fclose(fid);
+end
+man = jsondecode(fileread(manifestPath));
+flatOrder = string(man.flatOrder);
+store_vec = logical(man.store_vec);
+shards = arrayfun(@(x) fullfile(rootDir,x.file), man.shards, "UniformOutput",false);
+nums   = arrayfun(@(x) x.num_samples, man.shards);
+
+% ---------------- Pass1 mean/std ----------------
+fprintf("Pass1: computing mean/std for X & Y...\n");
+muX=zeros(60,1,'double'); M2X=zeros(60,1,'double'); cntX=0;
+muY=zeros(36,1,'double'); M2Y=zeros(36,1,'double'); cntY=0;
+
+for s=1:numel(shards)
+    data=py.numpy.load(shards{s}, pyargs("allow_pickle",true));
+    % X
+    if store_vec
+        Xpy=data.get('X_vec60'); Xs=double(py.numpy.array(Xpy)); sh=cell(Xpy.shape);
+        K=double(sh{2}); Xs=reshape(Xs,60,K);
+    else
+        XmPy=data.get('X_mats'); Xm=double(py.numpy.array(XmPy)); sh=cell(XmPy.shape);
+        K=double(sh{4}); Xs=zeros(60,K);
+        for k=1:K, Xs(:,k)=pack_5mats_to_vec60(Xm(:,:,:,k),flatOrder); end
+    end
+    for k=1:K
+        cntX=cntX+1; dx=Xs(:,k)-muX; muX=muX+dx/cntX; M2X=M2X+dx.*(Xs(:,k)-muX);
+    end
+    % Y
+    if store_vec
+        Ypy=data.get('Y_vec36'); Ys=double(py.numpy.array(Ypy)); sh=cell(Ypy.shape); % expect 36 x K
+        if numel(sh)>=2, K = double(sh{2}); end
+    else
+        YmPy=data.get('Y_mats'); Ym=double(py.numpy.array(YmPy));
+        Ys=zeros(36,K); for k=1:K, Ys(:,k)=pack_3mats_to_vec36(Ym(:,:,:,k),flatOrder); end
+    end
+    for k=1:K
+        cntY=cntY+1; dy=Ys(:,k)-muY; muY=muY+dy/cntY; M2Y=M2Y+dy.*(Ys(:,k)-muY);
+    end
+end
+sigX=sqrt(max(M2X/(max(1,cntX-1)),1e-12));
+sigY=sqrt(max(M2Y/(max(1,cntY-1)),1e-12));
+fprintf("Mean/std computed from %d(X) / %d(Y) samples.\n", cntX, cntY);
+
+% ---------------- Config ----------------
+cfg.numEpochs      = 1000;
+cfg.miniBatch      = 2048;
+cfg.valRatio       = 0.10;
+cfg.baseLR         = 1e-3;
+cfg.minLR          = 1e-5;
+cfg.scheduler      = "cosine";
+cfg.stepIters      = 2000;
+cfg.stepGamma      = 0.5;
+cfg.l2Factor       = 1e-6;
+cfg.dropoutRate    = 0.00;
+cfg.hidden         = [1024 512 256];
+cfg.w_ortho        = 0.01;
+cfg.w_scale        = 0.01;
+cfg.earlyStopOn    = true;
+cfg.earlyStopPat   = 2000;
+cfg.earlyStopMinDelta = 0.0;
+
+trainPerEpoch = sum(max(0, round(nums.*(1-cfg.valRatio))));
+itersPerEpoch = max(1, ceil(trainPerEpoch / cfg.miniBatch));
+totalItersEst = max(1, cfg.numEpochs * itersPerEpoch);
+
+% ---------------- Network (36 out) ----------------
+layers = [featureInputLayer(60,"Normalization","none","Name","in")];
+for i = 1:numel(cfg.hidden)
+    h = cfg.hidden(i);
+    layers = [layers; fullyConnectedLayer(h,"Name",sprintf("fc%d",i))];
+    layers = [layers; reluLayer("Name",sprintf("relu%d",i))];
+    if cfg.dropoutRate>0
+        layers = [layers; dropoutLayer(cfg.dropoutRate,"Name",sprintf("drop%d",i))];
+    end
+end
+layers = [layers; fullyConnectedLayer(36,"Name","fc_out")];
+net = dlnetwork(layerGraph(layers));
+
+% >>> 把网络参数放到 GPU（如果可用）
+net = dlupdate(@(x) dev(toSingle(x)), net);
+
+% Adam
+gradBeta1=0.9; gradBeta2=0.999; eps=1e-8;
+tAvg=[]; tAvgSq=[];
+
+% ---------------- Plot ----------------
+fig = figure('Name','Training Curve','NumberTitle','off');
+ax  = axes(fig); grid(ax,'on'); hold(ax,'on');
+yyaxis left;
+hTrain = animatedline('Color',[0.2 0.6 1],'LineWidth',1.5);
+hVal   = animatedline('Color',[1 0.3 0.3],'LineWidth',1.5);
+ylabel('Loss'); xlabel('Iteration');
+yyaxis right; hLR = animatedline('Color',[0.1 0.8 0.4],'LineWidth',1.5); ylabel('LR');
+title('Train/Val Loss and Learning Rate'); drawnow;
+
+bestVal=inf; bestIter=0; bestEpoch=0; bestMarker=[];
+logI=[]; logT=[]; logV=[]; logLR=[];
+iter=0; sinceBest=0;
+
+% 让 muY/sigY 与 Yhat_std 同设备、同精度
+muY_dev  = dev(toSingle(muY));
+sigY_dev = dev(toSingle(sigY));
+
+% ---------------- Train ----------------
+for e=1:cfg.numEpochs
+    fprintf("Epoch %d/%d\n", e, cfg.numEpochs);
+    ord=randperm(numel(shards));
+    for si=1:numel(ord)
+        data=py.numpy.load(shards{ord(si)}, pyargs("allow_pickle",true));
+        if store_vec
+            Xo=double(py.numpy.array(data.get('X_vec60')));
+            Yo=double(py.numpy.array(data.get('Y_vec36')));
+            K=size(Xo,2);
+        else
+            XmPy=data.get('X_mats'); YmPy=data.get('Y_mats');
+            Xm=double(py.numpy.array(XmPy)); Ym=double(py.numpy.array(YmPy));
+            shX=cell(XmPy.shape); K=double(shX{4});
+            Xo=zeros(60,K); Yo=zeros(36,K);
+            for k=1:K
+                Xo(:,k)=pack_5mats_to_vec60(Xm(:,:,:,k),flatOrder);
+                Yo(:,k)=pack_3mats_to_vec36(Ym(:,:,:,k),flatOrder);
+            end
+        end
+
+        X=(Xo-muX)./sigX;
+        Y=(Yo-muY)./sigY;
+
+        idx=randperm(K); nVal=max(1, round(K*cfg.valRatio));
+        valIdx=idx(1:nVal); trnIdx=idx(nVal+1:end);
+        Xtr=X(:,trnIdx); Ytr=Y(:,trnIdx);
+        Xv =X(:,valIdx); Yv =Y(:,valIdx);
+
+        for t=1:cfg.miniBatch:size(Xtr,2)
+            sel=t:min(t+cfg.miniBatch-1,size(Xtr,2));
+            % >>> 把 batch 放到 GPU，并做 dlarray
+            Xb=dlarray(dev(toSingle(Xtr(:,sel))),"CB");
+            Yb=dlarray(dev(toSingle(Ytr(:,sel))),"CB");
+
+            lr = scheduleLR(cfg, iter+1, totalItersEst);
+            yyaxis right; addpoints(hLR,iter+1,lr);
+
+            [grad,loss,~,~]=dlfeval(@modelGradientsL2OrthoScale_vec,net,Xb,Yb,cfg,muY_dev,sigY_dev);
+            [net,tAvg,tAvgSq]=adamupdate(net,grad,tAvg,tAvgSq,iter+1,lr,gradBeta1,gradBeta2,eps);
+            iter=iter+1;
+
+            [~,valLoss,~,~]=dlfeval(@modelGradientsL2OrthoScale_vec_nograd,net, ...
+                dlarray(dev(toSingle(Xv)),"CB"), dlarray(dev(toSingle(Yv)),"CB"), cfg, muY_dev, sigY_dev);
+
+            trainLoss=double(gather(extractdata(loss)));
+            valLoss  =double(gather(extractdata(valLoss)));
+
+            yyaxis left; addpoints(hTrain,iter,trainLoss); addpoints(hVal,iter,valLoss);
+            drawnow limitrate
+
+            logI(end+1)=iter; logT(end+1)=trainLoss; logV(end+1)=valLoss; logLR(end+1)=lr; %#ok<AGROW>
+            fprintf("  iter=%d  lr=%.6g  train=%.6f  val=%.6f\n", iter,lr,trainLoss,valLoss);
+
+            if valLoss < bestVal - cfg.earlyStopMinDelta
+                bestVal=valLoss; bestIter=iter; bestEpoch=e; sinceBest=0;
+                if ~isempty(bestMarker) && isvalid(bestMarker), delete(bestMarker); end
+                yyaxis left; bestMarker=plot(bestIter,bestVal,'o','MarkerSize',10,'LineWidth',1.5,'MarkerEdgeColor',[0 0 0],'MarkerFaceColor',[1 1 0]);
+                prep.muX=muX(:); prep.sigX=sigX(:); prep.muY=muY(:); prep.sigY=sigY(:); prep.flatOrder=char(flatOrder); prep.outputFormat='mat3x4';
+                % 为了能在 CPU 读取，保存前把 net 移回 CPU
+                net_ckpt = dlupdate(@gather, net);
+                save(fullfile(outDir,'checkpoint_best.mat'),'net_ckpt','prep','bestIter','bestVal','bestEpoch','-v7.3');
+            else
+                sinceBest=sinceBest+1;
+            end
+            if cfg.earlyStopOn && sinceBest>=cfg.earlyStopPat
+                fprintf("Early stopping triggered.\n");
+                break;
+            end
+        end
+        if cfg.earlyStopOn && sinceBest>=cfg.earlyStopPat, break; end
+    end
+    if cfg.earlyStopOn && sinceBest>=cfg.earlyStopPat, break; end
+end
+
+fprintf("Training done.\n");
+
+% ---------------- Inference net (no dropout) ----------------
+layers_infer = [featureInputLayer(60,"Normalization","none","Name","in")];
+for i = 1:numel(cfg.hidden)
+    h = cfg.hidden(i);
+    layers_infer = [layers_infer; fullyConnectedLayer(h,"Name",sprintf("fc%d",i))];
+    layers_infer = [layers_infer; reluLayer("Name",sprintf("relu%d",i))];
+end
+layers_infer = [layers_infer; fullyConnectedLayer(36,"Name","fc_out")];
+lgraph_infer = layerGraph(layers_infer);
+lgraph_infer = assignLearnables(lgraph_infer, net);
+net_infer    = dlnetwork(lgraph_infer);
+
+% ---------------- Eval RMSE (de-std) ----------------
+data=py.numpy.load(shards{1}, pyargs("allow_pickle",true));
+if store_vec
+    Xeval=double(py.numpy.array(data.get('X_vec60')));  Yeval=double(py.numpy.array(data.get('Y_vec36')));
+else
+    XmPy=data.get('X_mats'); YmPy=data.get('Y_mats');
+    Xm=double(py.numpy.array(XmPy)); Ym=double(py.numpy.array(YmPy));
+    shX=cell(XmPy.shape); K=double(shX{4});
+    Xeval=zeros(60,K); Yeval=zeros(36,K);
+    for k=1:K
+        Xeval(:,k)=pack_5mats_to_vec60(Xm(:,:,:,k),flatOrder);
+        Yeval(:,k)=pack_3mats_to_vec36(Ym(:,:,:,k),flatOrder);
+    end
+end
+Xn = (Xeval - muX) ./ sigX;
+Ypred_std = forward(net_infer, dlarray(toSingle(Xn),"CB"));
+Ypred_std = double(extractdata(Ypred_std));
+Ypred = Ypred_std .* sigY + muY;
+rmse = sqrt(mean((Ypred(:) - Yeval(:)).^2));
+fprintf("Final Validation RMSE (orig): %.6f\n", rmse);
+
+% ---------------- Save ----------------
+saveas(fig, fullfile(outDir,'training_curve.png'));
+T=table(logI(:),logT(:),logV(:),logLR(:), 'VariableNames',{'iteration','train_loss','val_loss','learning_rate'});
+writetable(T, fullfile(outDir,'training_log.csv'));
+save(fullfile(outDir,"final_rmse.mat"),"rmse","bestVal","bestIter","bestEpoch");
+
+prep.muX=muX(:); prep.sigX=sigX(:); prep.muY=muY(:); prep.sigY=sigY(:); prep.flatOrder=char(flatOrder); prep.outputFormat='mat3x4';
+fid=fopen(fullfile(outDir,"deformer_mapper_prep.json"),'w'); fwrite(fid,jsonencode(prep)); fclose(fid);
+save(fullfile(outDir,"deformer_mapper_dlnet.mat"),"net_infer","-v7.3");
+
+onnxPath=fullfile(outDir,"deformer_mapper.onnx");
+try
+    if exist('exportONNXNetwork','file')==2
+        exportONNXNetwork(lgraph_infer,onnxPath,"OpsetVersion",17);
+        fprintf("ONNX exported: %s\n",onnxPath);
+    else
+        fprintf("ONNX Converter not installed, skip ONNX export.\n");
+    end
+catch ME
+    warning("ONNX export failed: %s", ME.message);
+end
+
+try
+    x_ref = Xeval(:,1); y_ref = Yeval(:,1); y_pred_ref = Ypred(:,1);
+    py.numpy.savez( fullfile(outDir,"selfcheck_bundle.npz"), ...
+        pyargs("x_ref",x_ref,"y_ref",y_ref,"y_pred_ref",y_pred_ref, ...
+               "muX",muX,"sigX",sigX,"muY",muY,"sigY",sigY, ...
+               "flatOrder",prep.flatOrder,"outputFormat",prep.outputFormat));
+catch
+end
+
+fprintf("All done. Output: %s\n", outDir);
+fprintf("Best Val: %.6f at iter=%d (epoch %d)\n", bestVal,bestIter,bestEpoch);
+fprintf("Final RMSE(orig): %.6f\n", rmse);
+end
+
+% ================= Subfunctions =================
+function lr = scheduleLR(cfg, iter, totalItersEst)
+switch cfg.scheduler
+    case "cosine"
+        T = max(1,totalItersEst);
+        lr = cfg.minLR + 0.5*(cfg.baseLR - cfg.minLR)*(1 + cos(pi*(iter-1)/T));
+    case "step"
+        steps = floor((iter-1)/max(1,cfg.stepIters));
+        lr = cfg.baseLR * (cfg.stepGamma ^ steps);
+    otherwise
+        lr = cfg.baseLR;
+end
+end
+
+function [gradients,loss,orthoVal,scaleVal]=modelGradientsL2OrthoScale_vec(net,Xb,Yb_std,cfg,muY_dev,sigY_dev)
+Yhat_std = forward(net,Xb);
+mseLoss  = mse(Yhat_std, Yb_std);
+Yhat     = Yhat_std .* sigY_dev + muY_dev;
+[orthoVal,scaleVal] = ortho_scale_regs_vec(Yhat);
+
+reg=0; P=net.Learnables;
+for i=1:size(P,1)
+    if endsWith(string(P.Parameter(i)),"Weights")
+        reg = reg + sum(P.Value{i}.^2,'all');
+    end
+end
+
+loss = mseLoss + cfg.w_ortho * orthoVal + cfg.w_scale * scaleVal + cfg.l2Factor * reg;
+gradients = dlgradient(loss, net.Learnables);
+end
+
+function [dummy,loss,orthoVal,scaleVal]=modelGradientsL2OrthoScale_vec_nograd(net,Xb,Yb_std,cfg,muY_dev,sigY_dev)
+dummy = [];
+Yhat_std = forward(net,Xb);
+mseLoss  = mse(Yhat_std, Yb_std);
+Yhat     = Yhat_std .* sigY_dev + muY_dev;
+[orthoVal,scaleVal] = ortho_scale_regs_vec(Yhat);
+reg=0; P=net.Learnables;
+for i=1:size(P,1)
+    if endsWith(string(P.Parameter(i)),"Weights")
+        reg = reg + sum(P.Value{i}.^2,'all');
+    end
+end
+loss = mseLoss + cfg.w_ortho * orthoVal + cfg.w_scale * scaleVal + cfg.l2Factor * reg;
+end
+
+function [L_ortho, L_scale] = ortho_scale_regs_vec(Y36)
+% Vectorized version; works on CPU/GPU, dlarray/gpuArray
+% Y36: [36 x B] ("CB")
+B = size(Y36,2);
+
+% 36 = 12 * 3 (三个 3x4)
+Y4 = reshape(Y36, 3,4,3,B);        % [3 x 4 x 3 x B]
+R  = Y4(:,1:3,:,:);                 % [3 x 3 x 3 x B]
+
+% 每列范数平方（对应 R 的三个列向量）
+c1 = sum(R(:,1,:,:).^2, 1);        % [1 x 1 x 3 x B]
+c2 = sum(R(:,2,:,:).^2, 1);
+c3 = sum(R(:,3,:,:).^2, 1);
+trace_RtR = c1 + c2 + c3;          % [1 x 1 x 3 x B]
+
+% RtR 的 Frobenius 范数平方
+Rpages = reshape(R, 3,3,[]);                      % 3 x 3 x (3B)
+RtR    = pagemtimes(permute(Rpages,[2 1 3]), Rpages);   % 3 x 3 x (3B)
+fro_RtR_sq = sum(RtR.^2, [1 2]);
+fro_RtR_sq = reshape(fro_RtR_sq, 1,1,3,B);        % [1 x 1 x 3 x B]
+
+% 目标
+O = fro_RtR_sq - 2*trace_RtR + 3;                 % [1 x 1 x 3 x B]
+S = (c1-1).^2 + (c2-1).^2 + (c3-1).^2;            % [1 x 1 x 3 x B]
+
+L_ortho = mean(O, 'all');
+L_scale = mean(S, 'all');
+end
+
+function lgraph=assignLearnables(lgraph,dlnet)
+params=dlnet.Learnables;
+for i=1:size(params,1)
+    layerName=params.Layer(i);
+    paramName=params.Parameter(i);
+    val=gather(extractdata(params.Value{i}));
+    hit=strcmp({lgraph.Layers.Name},layerName);
+    if any(hit)
+        L=lgraph.Layers(hit);
+        if isprop(L,paramName)
+            L.(paramName)=val;
+            lgraph=replaceLayer(lgraph,layerName,L);
+        end
+    end
+end
+end
+
+function vec60 = pack_5mats_to_vec60(mats_4x4x5, flatOrder)
+vec60 = zeros(60,1,'double'); idx = 1;
+for k = 1:5
+    M = mats_4x4x5(:,:,k);
+    M34 = M(1:3,1:4);
+    if flatOrder=="row"
+        v = reshape(M34, 12, 1);
+    else
+        v = reshape(transpose(M34), 12, 1);
+    end
+    vec60(idx:idx+11) = v; idx = idx + 12;
+end
+end
+
+function vec36 = pack_3mats_to_vec36(mats_4x4x3, flatOrder)
+vec36 = zeros(36,1,'double'); idx = 1;
+for k = 1:3
+    M = mats_4x4x3(:,:,k);
+    M34 = M(1:3,1:4);
+    if flatOrder=="row"
+        v = reshape(M34, 12, 1);
+    else
+        v = reshape(transpose(M34), 12, 1);
+    end
+    vec36(idx:idx+11) = v; idx = idx + 12;
+end
+end

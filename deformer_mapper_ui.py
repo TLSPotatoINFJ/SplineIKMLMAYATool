@@ -1,10 +1,11 @@
 # deformer_mapper_ui.py
 # Maya 2023+ | PySide2 | Python 3.9
 from __future__ import annotations
-import os, json, traceback, random, math, time
+import os, json, traceback, random, math, time, datetime
+from typing import Optional, List, Dict
 import numpy as np
 import numpy.linalg as la
-from typing import Optional, List, Dict
+
 from PySide2 import QtWidgets, QtCore, QtGui
 import maya.cmds as cmds
 from maya import mel  # maya.mel.eval
@@ -27,53 +28,47 @@ def get_maya_main_window():
     ptr = omui.MQtUtil.mainWindow()
     return wrapInstance(int(ptr), QtWidgets.QWidget)
 
-
 def _get_world_matrix(node: str) -> np.ndarray:
     m = cmds.xform(node, q=True, ws=True, m=True)
     return np.array(m, dtype=np.float64).reshape(4, 4)
 
-
-def _project_mat_svd(M34: np.ndarray) -> np.ndarray:
-    """对 3x4 的前部进行 SVD，使旋转正交，缩放≈1。"""
-    R3 = M34[:, :3]
-    U, _, Vt = la.svd(R3, full_matrices=False)
-    R = U @ Vt
-    # 防止反射
-    if np.linalg.det(R) < 0:
-        U[:, 2] *= -1.0
-        R = U @ Vt
-    return np.hstack([R, M34[:, 3:4]])
-
-
 def _to_local_space(mats_world: List[np.ndarray]) -> List[np.ndarray]:
-    """把一组世界矩阵转到以第一项为参考的本地空间，本地= W @ W1_inv。"""
+    """
+    把一组世界矩阵转到以第一项为参考的本地空间，本地 = W @ W1_inv
+    """
     W1 = mats_world[0]
     W1_inv = la.inv(W1)
     return [M @ W1_inv for M in mats_world]
 
-
 def _from_local_to_world(mats_local: List[np.ndarray], W1_world: np.ndarray) -> List[np.ndarray]:
-    """把本地矩阵（以参考物体为原点）还原到世界，世界= L @ W1。"""
+    """
+    把本地矩阵还原到世界，世界 = L @ W1
+    """
     return [L @ W1_world for L in mats_local]
 
-
 def _pack_input_60(mats5_local: List[np.ndarray], flat_order="row") -> np.ndarray:
-    """5 个 4x4，本地空间，打成 60 维（去掉最后一行）。"""
+    """
+    5 个 4x4，本地空间，打成 60 维（去掉最后一行）
+    """
     vecs = []
     for M in mats5_local:
         M34 = M[:3, :4]
-        v = (M34.reshape(-1) if flat_order == "row" else M34.T.reshape(-1))
+        if flat_order == "row":
+            v = M34.reshape(-1)
+        else:
+            v = M34.T.reshape(-1)
         vecs.append(v.astype(np.float64))
     return np.concatenate(vecs, axis=0)  # (60,)
-
 
 def _pack_3mats_to_vec36(mats3_local: List[np.ndarray], flat_order="row") -> np.ndarray:
     out = []
     for M in mats3_local:
         M34 = M[:3, :4]
-        out.extend(M34.reshape(-1) if flat_order == "row" else M34.T.reshape(-1))
+        if flat_order == "row":
+            out.extend(M34.reshape(-1))
+        else:
+            out.extend(M34.T.reshape(-1))
     return np.asarray(out, dtype=np.float64)  # (36,)
-
 
 def _unpack_output_36_to_3mats(v36: np.ndarray, flat_order="row") -> List[np.ndarray]:
     v36 = v36.reshape(-1)
@@ -81,12 +76,22 @@ def _unpack_output_36_to_3mats(v36: np.ndarray, flat_order="row") -> List[np.nda
     mats = []
     for k in range(3):
         seg = v36[k*12:(k+1)*12]
-        M34 = (seg.reshape(3,4) if flat_order == "row" else seg.reshape(4,3).T)
+        if flat_order == "row":
+            M34 = seg.reshape(3,4)
+        else:
+            M34 = seg.reshape(4,3).T
         M = np.eye(4, dtype=np.float64)
         M[:3, :4] = M34
         mats.append(M)
+    # 添加SVD正交化
+    for i in range(len(mats)):
+        M = mats[i]
+        R = M[:3, :3]
+        U, S, Vh = la.svd(R)
+        R_orth = U @ Vh
+        M[:3, :3] = R_orth
+        mats[i] = M
     return mats
-
 
 def _vec60_to_5mats(vec60: np.ndarray, flat_order="row") -> List[np.ndarray]:
     vec60 = vec60.reshape(-1)
@@ -94,25 +99,14 @@ def _vec60_to_5mats(vec60: np.ndarray, flat_order="row") -> List[np.ndarray]:
     mats = []
     for k in range(5):
         seg = vec60[k*12:(k+1)*12]
-        M34 = (seg.reshape(3,4) if flat_order == "row" else seg.reshape(4,3).T)
+        if flat_order == "row":
+            M34 = seg.reshape(3,4)
+        else:
+            M34 = seg.reshape(4,3).T
         M = np.eye(4, dtype=np.float64)
         M[:3, :4] = M34
         mats.append(M)
     return mats
-
-
-def _save_sample_npz(path: str, sample_dict: Dict):
-    """统一写 npz 的小工具，跟 UI 导出保持一致"""
-    flatOrder = sample_dict.get("flatOrder", "row")
-    X_mats = sample_dict["X_mats"]
-    Y_mats = sample_dict["Y_mats"]
-    X_vec60 = sample_dict["X_vec60"]
-    Y_vec36 = sample_dict["Y_vec36"]
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    np.savez(path,
-             X_mats=X_mats, Y_mats=Y_mats,
-             X_vec60=X_vec60, Y_vec36=Y_vec36,
-             flatOrder=flatOrder)
 
 
 # =========================
@@ -135,36 +129,32 @@ class DeformerMapperSession:
 
         with open(prep_json, "r", encoding="utf-8") as f:
             prep = json.load(f)
-        self.muX  = np.array(prep["muX"], dtype=np.float64).reshape(60)
-        self.sigX = np.array(prep["sigX"], dtype=np.float64).reshape(60)
+        # 保持你的 prep 格式，但我们不做额外投影
+        self.muX  = np.array(prep.get("muX", [0]*60), dtype=np.float64).reshape(60)
+        self.sigX = np.array(prep.get("sigX", [1]*60), dtype=np.float64).reshape(60)
         self.flat_order = prep.get("flatOrder", "row")
-        self.muY  = np.array(prep.get("muY",  np.zeros(36)), dtype=np.float64).reshape(36)
-        self.sigY = np.array(prep.get("sigY", np.ones(36)*1.0), dtype=np.float64).reshape(36)
 
         self.in_name  = self.sess.get_inputs()[0].name
         self.out_name = self.sess.get_outputs()[0].name
 
-    def predict_from_nodes(self, input_nodes: List[str], project_svd=True) -> List[np.ndarray]:
+    def predict_from_nodes(self, input_nodes: List[str]) -> List[np.ndarray]:
         if len(input_nodes) != 5:
             raise ValueError("需要 5 个输入节点。")
 
-        # 世界 → 本地
+        # 世界 → 本地（以 In1 为基准）
         mats5_world = [_get_world_matrix(n) for n in input_nodes]
         mats5_local = _to_local_space(mats5_world)
 
+        # 打包“本地”输入，然后按 prep.json 的mu/sig做同样的公式
         x60 = _pack_input_60(mats5_local, self.flat_order)
-        xn  = (x60 - self.muX) / (self.sigX + 1e-12)
+        x_std = (x60 - self.muX) / (self.sigX + 1e-12)
 
-        y_std = self.sess.run([self.out_name], {self.in_name: xn.reshape(1, -1).astype(np.float32)})[0]
+        # 推理得到“本地”输出（不做 SVD 投影）
+        y_std = self.sess.run([self.out_name], {self.in_name: x_std.reshape(1, -1).astype(np.float32)})[0]
         v36   = y_std.reshape(-1).astype(np.float64)
         mats3_local = _unpack_output_36_to_3mats(v36, self.flat_order)
 
-        if project_svd:
-            for i in range(3):
-                M34 = mats3_local[i][:3, :4]
-                M34p = _project_mat_svd(M34)
-                mats3_local[i] = np.vstack([M34p, np.array([0,0,0,1.0])])
-
+        # 还原到世界：使用“当前” In1 世界矩阵
         W1_now = mats5_world[0]
         mats3_world = _from_local_to_world(mats3_local, W1_now)
         return mats3_world
@@ -174,18 +164,20 @@ class DeformerMapperSession:
             raise ValueError("需要 3 个输出节点。")
         mats3 = self.predict_from_nodes(input_nodes)
         for node, M in zip(output_nodes, mats3):
+            print(f"Applying to {node}:\n{np.array2string(M, precision=6, suppress_small=True)}")
             cmds.xform(node, ws=True, m=M.reshape(-1).tolist())
         return mats3
 
 
 # =========================
-# Random Motion（随机 + 每条单独导出 + Stop）
+# Random Motion（属性随机器 + 单文件导出 + Stop）
 # =========================
 class RandomMotionPanel(QtWidgets.QWidget):
     """
-    - 随机动面板里选的那个对象（它通过变形器影响5in/3out）
-    - 每次都 refresh(f=True)，保证读到的是“场景真正结算后的”矩阵
-    - 每次都直接存一个独立的 .npz 到指定文件夹
+    - 随机位姿（目标物体）
+    - 属性随机器（跟你之前的一样：表格里写 plug + min/max）
+    - 每一帧导出 5个输入+3个输出 的“本地空间”样本到一个 npz
+    - Stop 按钮
     """
     def __init__(self, parent=None, log_cb=None,
                  get_nodes_cb=None, get_sample_cb=None):
@@ -204,7 +196,7 @@ class RandomMotionPanel(QtWidgets.QWidget):
     def _resolve_plug(self, node: str, attr: str) -> Optional[str]:
         attr = attr.strip()
         if not node and "." in attr and cmds.objExists(attr):
-            return attr
+            return attr  # 完整 plug
         if node:
             plug = f"{node}.{attr}"
             if cmds.objExists(plug):
@@ -229,7 +221,7 @@ class RandomMotionPanel(QtWidgets.QWidget):
         self.object_line.returnPressed.connect(self.load_object_by_name)
         btn_sel = QtWidgets.QPushButton("Select from Scene"); btn_sel.clicked.connect(self.select_object)
         btn_ref = QtWidgets.QPushButton("Refresh Selection"); btn_ref.clicked.connect(self.select_object)
-        h.addWidget(QtWidgets.QLabel("Target Object:"))
+        h.addWidget(QtWidgets.QLabel("目标物体:"))
         h.addWidget(self.object_line); h.addWidget(btn_sel); h.addWidget(btn_ref)
         layout.addLayout(h)
 
@@ -237,8 +229,8 @@ class RandomMotionPanel(QtWidgets.QWidget):
         h2 = QtWidgets.QHBoxLayout()
         self.radius_spin = QtWidgets.QDoubleSpinBox(); self.radius_spin.setRange(0.0, 1e9); self.radius_spin.setValue(self.radius); self.radius_spin.valueChanged.connect(self.update_radius)
         self.iterations_spin = QtWidgets.QSpinBox(); self.iterations_spin.setRange(1, 1000000); self.iterations_spin.setValue(self.iterations); self.iterations_spin.valueChanged.connect(self.update_iterations)
-        h2.addWidget(QtWidgets.QLabel("Radius:")); h2.addWidget(self.radius_spin)
-        h2.addWidget(QtWidgets.QLabel("Iterations:")); h2.addWidget(self.iterations_spin)
+        h2.addWidget(QtWidgets.QLabel("半径:")); h2.addWidget(self.radius_spin)
+        h2.addWidget(QtWidgets.QLabel("迭代次数:")); h2.addWidget(self.iterations_spin)
         layout.addLayout(h2)
 
         # 中心位置
@@ -246,47 +238,47 @@ class RandomMotionPanel(QtWidgets.QWidget):
         self.center_x = QtWidgets.QDoubleSpinBox(); self.center_x.setRange(-1e9, 1e9)
         self.center_y = QtWidgets.QDoubleSpinBox(); self.center_y.setRange(-1e9, 1e9)
         self.center_z = QtWidgets.QDoubleSpinBox(); self.center_z.setRange(-1e9, 1e9)
-        h3.addWidget(QtWidgets.QLabel("Center (auto-set):"))
+        h3.addWidget(QtWidgets.QLabel("中心位置 (自动设置):"))
         h3.addWidget(QtWidgets.QLabel("X:")); h3.addWidget(self.center_x)
         h3.addWidget(QtWidgets.QLabel("Y:")); h3.addWidget(self.center_y)
         h3.addWidget(QtWidgets.QLabel("Z:")); h3.addWidget(self.center_z)
         layout.addLayout(h3)
-        self.update_center_btn = QtWidgets.QPushButton("Update Center to Pivot")
+        self.update_center_btn = QtWidgets.QPushButton("更新中心到轴心")
         self.update_center_btn.setEnabled(False)
         self.update_center_btn.clicked.connect(self.update_center)
         layout.addWidget(self.update_center_btn)
 
-        # 导出设置（简化版）
-        exp_box = QtWidgets.QGroupBox("Per-sample Export (.npz)")
+        # 导出设置：每次一文件
+        exp_box = QtWidgets.QGroupBox("每样本导出 (.npz)")
         gl = QtWidgets.QGridLayout(exp_box)
-        self.export_chk = QtWidgets.QCheckBox("Enable"); self.export_chk.setChecked(False)
+        self.export_chk = QtWidgets.QCheckBox("启用"); self.export_chk.setChecked(False)
         self.dir_edit = QtWidgets.QLineEdit()
-        btn_dir = QtWidgets.QPushButton("Browse…"); btn_dir.clicked.connect(self._browse_dir)
+        btn_dir = QtWidgets.QPushButton("浏览…"); btn_dir.clicked.connect(self._browse_dir)
         self.prefix_edit = QtWidgets.QLineEdit("sample")
         gl.addWidget(self.export_chk, 0, 0)
-        gl.addWidget(QtWidgets.QLabel("Export dir:"), 1, 0); gl.addWidget(self.dir_edit, 1, 1); gl.addWidget(btn_dir, 1, 2)
-        gl.addWidget(QtWidgets.QLabel("File prefix:"), 2, 0); gl.addWidget(self.prefix_edit, 2, 1, 1, 2)
+        gl.addWidget(QtWidgets.QLabel("导出目录:"), 1, 0); gl.addWidget(self.dir_edit, 1, 1); gl.addWidget(btn_dir, 1, 2)
+        gl.addWidget(QtWidgets.QLabel("前缀:"), 2, 0); gl.addWidget(self.prefix_edit, 2, 1, 1, 2)
         layout.addWidget(exp_box)
 
         # Attribute Randomizer
-        attr_box = QtWidgets.QGroupBox("Attribute Randomizer (strict validated)")
+        attr_box = QtWidgets.QGroupBox("属性随机器")
         v = QtWidgets.QVBoxLayout(attr_box)
         th = QtWidgets.QHBoxLayout()
-        self.attr_name_edit = QtWidgets.QLineEdit(); self.attr_name_edit.setPlaceholderText("Attr or full plug (e.g., endAngle / polyPipeShape1.endAngle)")
+        self.attr_name_edit = QtWidgets.QLineEdit(); self.attr_name_edit.setPlaceholderText("属性或完整plug (e.g., endAngle / pCube1.translateX)")
         self.attr_min_spin = QtWidgets.QDoubleSpinBox(); self.attr_min_spin.setRange(-1e12, 1e12); self.attr_min_spin.setValue(0.0)
         self.attr_max_spin = QtWidgets.QDoubleSpinBox(); self.attr_max_spin.setRange(-1e12, 1e12); self.attr_max_spin.setValue(1.0)
-        btn_add_sel   = QtWidgets.QPushButton("Add Rows from Selection"); btn_add_sel.clicked.connect(self._add_rows_from_selection)
-        btn_add_chbox = QtWidgets.QPushButton("Add From Channel Box"); btn_add_chbox.clicked.connect(self._add_from_channel_box)
-        btn_remove    = QtWidgets.QPushButton("Remove Selected"); btn_remove.clicked.connect(self._remove_selected_rows)
-        btn_probe     = QtWidgets.QPushButton("Probe Rules"); btn_probe.clicked.connect(self._probe_rules)
-        th.addWidget(QtWidgets.QLabel("Attr/Plug:")); th.addWidget(self.attr_name_edit, 2)
-        th.addWidget(QtWidgets.QLabel("Min:")); th.addWidget(self.attr_min_spin)
-        th.addWidget(QtWidgets.QLabel("Max:")); th.addWidget(self.attr_max_spin)
+        btn_add_sel   = QtWidgets.QPushButton("从选择添加行");  btn_add_sel.clicked.connect(self._add_rows_from_selection)
+        btn_add_chbox = QtWidgets.QPushButton("从通道盒添加");  btn_add_chbox.clicked.connect(self._add_from_channel_box)
+        btn_remove    = QtWidgets.QPushButton("移除选中");       btn_remove.clicked.connect(self._remove_selected_rows)
+        btn_probe     = QtWidgets.QPushButton("探查规则");       btn_probe.clicked.connect(self._probe_rules)
+        th.addWidget(QtWidgets.QLabel("属性/Plug:")); th.addWidget(self.attr_name_edit, 2)
+        th.addWidget(QtWidgets.QLabel("最小:")); th.addWidget(self.attr_min_spin)
+        th.addWidget(QtWidgets.QLabel("最大:")); th.addWidget(self.attr_max_spin)
         th.addWidget(btn_add_sel); th.addWidget(btn_add_chbox); th.addWidget(btn_remove); th.addWidget(btn_probe)
         v.addLayout(th)
 
         self.attr_table = QtWidgets.QTableWidget(0, 5)
-        self.attr_table.setHorizontalHeaderLabels(["Node", "Attr/Plug", "Min", "Max", "Resolved Plug"])
+        self.attr_table.setHorizontalHeaderLabels(["节点", "属性/Plug", "最小", "最大", "解析Plug"])
         self.attr_table.horizontalHeader().setStretchLastSection(True)
         self.attr_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.attr_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -295,22 +287,22 @@ class RandomMotionPanel(QtWidgets.QWidget):
 
         # 执行按钮与状态
         btns = QtWidgets.QHBoxLayout()
-        self.random_btn = QtWidgets.QPushButton("Start Random Move")
+        self.random_btn = QtWidgets.QPushButton("开始随机移动")
         self.random_btn.setEnabled(False)
         self.random_btn.clicked.connect(self.random_move)
-        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.stop_btn = QtWidgets.QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._on_stop_clicked)
         btns.addWidget(self.random_btn); btns.addWidget(self.stop_btn)
         layout.addLayout(btns)
 
-        self.status_label = QtWidgets.QLabel("No object selected. Select and click 'Select from Scene'.")
+        self.status_label = QtWidgets.QLabel("无物体选中。请选中物体并点击 '从场景选择'。")
         layout.addWidget(self.status_label)
         layout.addStretch(1)
 
     # ---------- 基础逻辑 ----------
     def _browse_dir(self):
-        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose Export Directory", "")
+        p = QtWidgets.QFileDialog.getExistingDirectory(self, "选择导出目录", "")
         if p: self.dir_edit.setText(p)
 
     def load_object_by_name(self):
@@ -319,10 +311,10 @@ class RandomMotionPanel(QtWidgets.QWidget):
             self.target_object = obj_name
             self.random_btn.setEnabled(True); self.update_center_btn.setEnabled(True)
             self.update_center()
-            self.status_label.setText(f"Loaded: {self.target_object}")
-            self._log(f"RandomMotion: Loaded {self.target_object}")
+            self.status_label.setText(f"已加载: {self.target_object}")
+            self._log(f"RandomMotion: 已加载 {self.target_object}")
         else:
-            QtWidgets.QMessageBox.warning(self, "Warning", f"Object '{obj_name}' not found.")
+            QtWidgets.QMessageBox.warning(self, "警告", f"物体 '{obj_name}' 不存在。")
 
     def select_object(self):
         sel = cmds.ls(sl=True, transforms=True)
@@ -331,10 +323,10 @@ class RandomMotionPanel(QtWidgets.QWidget):
             self.object_line.setText(self.target_object)
             self.random_btn.setEnabled(True); self.update_center_btn.setEnabled(True)
             self.update_center()
-            self.status_label.setText(f"Selected: {self.target_object}")
-            self._log(f"RandomMotion: Selected {self.target_object}")
+            self.status_label.setText(f"已选中: {self.target_object}")
+            self._log(f"RandomMotion: 已选中 {self.target_object}")
         else:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Please select an object in the scene first.")
+            QtWidgets.QMessageBox.warning(self, "警告", "请先在场景中选中一个物体。")
 
     def update_radius(self, value): self.radius = value
     def update_iterations(self, value): self.iterations = value
@@ -346,10 +338,10 @@ class RandomMotionPanel(QtWidgets.QWidget):
                 self.center_x.setValue(self.center_pos[0])
                 self.center_y.setValue(self.center_pos[1])
                 self.center_z.setValue(self.center_pos[2])
-                self.status_label.setText(f"Center updated to: {self.center_pos}")
+                self.status_label.setText(f"中心已更新到: {self.center_pos}")
             except Exception as e:
-                cmds.warning(f"Error updating center: {e}")
-                self.status_label.setText(f"Error: {e}")
+                cmds.warning(f"更新中心错误: {e}")
+                self.status_label.setText(f"错误: {e}")
 
     # ---------- 规则增删查 ----------
     def _insert_rule_row(self, node, shown_attr, mn, mx, resolved_plug):
@@ -369,11 +361,11 @@ class RandomMotionPanel(QtWidgets.QWidget):
     def _add_rows_from_selection(self):
         raw = self.attr_name_edit.text().strip()
         if not raw:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Please enter attribute name or full plug.")
+            QtWidgets.QMessageBox.warning(self, "警告", "请输入属性名或完整plug。")
             return
         sel = cmds.ls(sl=True) or []
         if not sel:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Please select objects in scene.")
+            QtWidgets.QMessageBox.warning(self, "警告", "请在场景中选中物体。")
             return
         mn, mx = self.attr_min_spin.value(), self.attr_max_spin.value()
         if mn > mx: mn, mx = mx, mn
@@ -387,13 +379,13 @@ class RandomMotionPanel(QtWidgets.QWidget):
             self._insert_rule_row(node, raw, mn, mx, plug); added += 1
 
         if added == 0:
-            QtWidgets.QMessageBox.critical(self, "No Valid Attribute",
-                "No valid attributes were found on selection.\n\n" + "\n".join(skipped[:20]))
+            QtWidgets.QMessageBox.critical(self, "无有效属性",
+                "选中物体上未找到有效属性。\n\n" + "\n".join(skipped[:20]))
         else:
-            msg = f"Added {added} row(s)."
-            if skipped: msg += "\nSkipped:\n  - " + "\n  - ".join(skipped[:20])
-            QtWidgets.QMessageBox.information(self, "Add Results", msg)
-            self._log("[AddRows] " + msg)
+            msg = f"已添加 {added} 行。"
+            if skipped: msg += "\n跳过:\n  - " + "\n  - ".join(skipped[:20])
+            QtWidgets.QMessageBox.information(self, "添加结果", msg)
+            self._log("[添加行] " + msg)
 
     def _add_from_channel_box(self):
         try:
@@ -403,7 +395,8 @@ class RandomMotionPanel(QtWidgets.QWidget):
         except Exception:
             sels, obj = [], None
         if not sels or not obj:
-            QtWidgets.QMessageBox.warning(self, "Warning", "No attribute is selected in Channel Box."); return
+            QtWidgets.QMessageBox.warning(self, "警告", "通道盒中未选中属性。")
+            return
 
         mn, mx = self.attr_min_spin.value(), self.attr_max_spin.value()
         if mn > mx: mn, mx = mx, mn
@@ -415,17 +408,18 @@ class RandomMotionPanel(QtWidgets.QWidget):
             self._insert_rule_row(obj, attr, mn, mx, plug); added += 1
 
         if added == 0:
-            QtWidgets.QMessageBox.critical(self, "No Valid Attribute",
-                "No valid channel-box attributes were added.\n\n" + "\n".join(skipped[:20]))
+            QtWidgets.QMessageBox.critical(self, "无有效属性",
+                "通道盒中未添加有效属性。\n\n" + "\n".join(skipped[:20]))
         else:
-            msg = f"Added {added} row(s) from Channel Box."
-            if skipped: msg += "\nSkipped:\n  - " + "\n".join(skipped[:20])
-            QtWidgets.QMessageBox.information(self, "Add Results", msg)
-            self._log("[AddFromChannelBox] " + msg)
+            msg = f"从通道盒添加 {added} 行。"
+            if skipped: msg += "\n跳过:\n  - " + "\n  - ".join(skipped[:20])
+            QtWidgets.QMessageBox.information(self, "添加结果", msg)
+            self._log("[从通道盒添加] " + msg)
 
     def _remove_selected_rows(self):
         rows = sorted({i.row() for i in self.attr_table.selectedIndexes()}, reverse=True)
-        for r in rows: self.attr_table.removeRow(r)
+        for r in rows:
+            self.attr_table.removeRow(r)
 
     def _gather_attr_rules(self):
         rules = []
@@ -441,7 +435,7 @@ class RandomMotionPanel(QtWidgets.QWidget):
     def _probe_rules(self):
         rules = self._gather_attr_rules()
         if not rules:
-            self._log("[Probe] No rules.", "warn"); return
+            self._log("[探查] 无规则。", "warn"); return
         for rule in rules:
             plug = rule["plug"]
             try:
@@ -449,49 +443,53 @@ class RandomMotionPanel(QtWidgets.QWidget):
                 locked = cmds.getAttr(plug, lock=True)
                 atype = cmds.getAttr(plug, type=True)
                 try: val = cmds.getAttr(plug)
-                except: val = "<unreadable>"
-                self._log(f"[Probe] {plug} | type={atype} | locked={locked} | connected={'Yes' if con else 'No'} | value={val}")
+                except: val = "<不可读>"
+                self._log(f"[探查] {plug} | 类型={atype} | 锁定={locked} | 连接={'是' if con else '否'} | 值={val}")
             except Exception as e:
-                self._log(f"[Probe] {plug} error: {e}", "error")
+                self._log(f"[探查] {plug} 错误: {e}", "error")
 
     # ---------- Stop ----------
     def _on_stop_clicked(self):
         self._stop_flag = True
         self.stop_btn.setEnabled(False)
-        self.status_label.setText("Stop requested... finishing current iteration.")
+        self.status_label.setText("停止请求... 完成当前迭代。")
         self._log("用户请求中断 Random Move。", "warn")
 
     def _set_running_ui(self, running: bool):
-        for w in [self.object_line, self.radius_spin, self.iterations_spin,
-                  self.update_center_btn, self.export_chk, self.dir_edit,
-                  self.prefix_edit,
-                  self.attr_name_edit, self.attr_min_spin, self.attr_max_spin, self.attr_table]:
+        widgets = [
+            self.object_line, self.radius_spin, self.iterations_spin,
+            self.update_center_btn, self.export_chk, self.dir_edit,
+            self.prefix_edit, self.attr_name_edit, self.attr_min_spin,
+            self.attr_max_spin, self.attr_table
+        ]
+        for w in widgets:
             w.setEnabled(not running)
         self.random_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
         QtWidgets.QApplication.processEvents()
 
-    # ---------- 随机移动 & 每条单独导出 ----------
+    # ---------- 随机移动 & 单文件导出（支持中断） ----------
     def random_move(self):
         if not self.target_object:
-            QtWidgets.QMessageBox.warning(self, "Warning", "No target object selected.")
+            QtWidgets.QMessageBox.warning(self, "警告", "未选中目标物体。")
             return
 
         self._stop_flag = False
         self._set_running_ui(True)
-        self.status_label.setText("Running... (Per-sample export). Click Stop to interrupt.")
+        self.status_label.setText("运行中... (每样本导出)。点击停止中断。")
 
+        cmds.refresh(suspend=True)
         try:
             self.center_pos = [self.center_x.value(), self.center_y.value(), self.center_z.value()]
             do_export = self.export_chk.isChecked()
             export_dir = self.dir_edit.text().strip()
             prefix = self.prefix_edit.text().strip() or "sample"
 
-            if do_export and not export_dir:
-                QtWidgets.QMessageBox.warning(self, "Warning", "Please choose an export directory.")
-                self._set_running_ui(False)
-                return
             if do_export:
+                if not export_dir:
+                    QtWidgets.QMessageBox.warning(self, "警告", "请选择导出目录。")
+                    self._set_running_ui(False)
+                    return
                 os.makedirs(export_dir, exist_ok=True)
 
             rules = self._gather_attr_rules()
@@ -519,34 +517,40 @@ class RandomMotionPanel(QtWidgets.QWidget):
                 if rules:
                     self._apply_random_attrs(rules)
 
-                # 3) 强制刷新，让DG算完，再抓 5in/3out
-                cmds.refresh(f=True)
-
-                # 4) 导出这一条
+                # 3) 导出当前5in/3out
                 if do_export and self._get_sample_cb:
                     sample = self._get_sample_cb()
                     if sample:
-                        ts = time.strftime("%Y%m%d_%H%M%S")
-                        fname = f"{prefix}_{ts}_{it:06d}.npz"
+                        flatOrder = sample.get("flatOrder","row")
+                        # 每次一文件
+                        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        fname = f"{prefix}_{stamp}_{it:06d}.npz"
                         fpath = os.path.join(export_dir, fname)
-                        try:
-                            _save_sample_npz(fpath, sample)
-                            self._log(f"[Export] saved: {fpath}")
-                        except Exception as e:
-                            self._log(f"[Export] save failed: {e}", "error")
+                        np.savez(
+                            fpath,
+                            X_mats=sample["X_mats"],
+                            Y_mats=sample["Y_mats"],
+                            X_vec60=sample["X_vec60"],
+                            Y_vec36=sample["Y_vec36"],
+                            flatOrder=flatOrder
+                        )
+                        print(f"Exported y (Y_vec36) for {fpath}:\n{np.array2string(sample['Y_vec36'], precision=6, suppress_small=True)}")
+                        self._log(f"[导出] {fpath}")
                     else:
-                        self._log("Export skipped: sample callback returned None.", "warn")
+                        self._log("导出跳过: 样本回调返回 None。", "warn")
 
                 if it % 10 == 0:
                     QtWidgets.QApplication.processEvents()
 
-            self.status_label.setText(f"Completed or Stopped at {it}/{self.iterations}. Final pos: {last_pos}")
-            self._log(f"RandomMotion: Done/Stopped at {it}/{self.iterations}. Final pos: {last_pos}")
+            self.status_label.setText(f"完成或停止于 {it}/{self.iterations}。最终位置: {last_pos}")
+            self._log(f"RandomMotion: 完成/停止于 {it}/{self.iterations}。最终位置: {last_pos}")
 
         except Exception:
-            self._log("RandomMove failed:\n" + traceback.format_exc(), "error")
+            self._log("RandomMove 失败:\n" + traceback.format_exc(), "error")
 
         finally:
+            cmds.refresh(suspend=False)
+            cmds.refresh()
             self._set_running_ui(False)
             self._stop_flag = False
             QtWidgets.QApplication.processEvents()
@@ -556,19 +560,15 @@ class RandomMotionPanel(QtWidgets.QWidget):
             plug, vmin, vmax = rule["plug"], rule["min"], rule["max"]
             try:
                 if cmds.getAttr(plug, lock=True):
-                    self._log(f"[Attr] Locked: {plug}", "warn")
-                    continue
+                    self._log(f"[属性] 锁定: {plug}", "warn"); continue
                 con = cmds.listConnections(plug, s=True, d=False, p=True) or []
                 if con:
-                    self._log(f"[Attr] Skipped connected plug: {plug} <- {con[0]}", "warn")
-                    continue
-
+                    self._log(f"[属性] 跳过连接plug: {plug} <- {con[0]}", "warn"); continue
                 atype = cmds.getAttr(plug, type=True)
                 val = random.uniform(vmin, vmax)
 
                 if atype in ("long","short","byte","bool","enum"):
-                    val = int(round(val))
-                    cmds.setAttr(plug, val)
+                    cmds.setAttr(plug, int(round(val)))
                 elif atype in ("double","float","doubleAngle","doubleLinear"):
                     cmds.setAttr(plug, float(val))
                 elif atype == "double3":
@@ -578,18 +578,12 @@ class RandomMotionPanel(QtWidgets.QWidget):
                     except Exception:
                         for axis, vv in zip(("X","Y","Z"), v3):
                             sub = plug + axis if not plug.endswith(("X","Y","Z")) else plug
-                            try:
-                                cmds.setAttr(sub, vv)
-                            except Exception as e2:
-                                self._log(f"[Attr] Set failed {sub}: {e2}", "warn")
-                        continue
+                            try: cmds.setAttr(sub, vv)
+                            except Exception as e2: self._log(f"[属性] 设置失败 {sub}: {e2}", "warn")
                 else:
-                    self._log(f"[Attr] Unsupported type '{atype}' on {plug}", "warn")
-                    continue
-
-                self._log(f"[Attr] {plug} set to {val if atype!='double3' else '[...]'}")
+                    self._log(f"[属性] 不支持类型 '{atype}' 于 {plug}", "warn")
             except Exception as e:
-                self._log(f"[Attr] Set failed {plug}: {e}", "error")
+                self._log(f"[属性] 设置失败 {plug}: {e}", "error")
 
     def showEvent(self, event):
         try:
@@ -609,17 +603,17 @@ class RandomMotionPanel(QtWidgets.QWidget):
 # 主窗口
 # =========================
 class DeformerMapperUI(QtWidgets.QDialog):
-    WINDOW_TITLE = "Deformer Tools (Mapper + Random Motion + Per-sample Export)"
+    WINDOW_TITLE = "形变工具 (Mapper + 随机移动)"
 
     def __init__(self, parent=None):
         super().__init__(parent or get_maya_main_window())
         self.setWindowTitle(self.WINDOW_TITLE)
         self.setMinimumWidth(960)
-        self.session = None  # type: Optional[DeformerMapperSession]
+        self.session: Optional[DeformerMapperSession] = None
         self._build_ui()
 
     def _log(self, msg: str, level: str = "info"):
-        prefix = {"info":"[INFO] ", "warn":"[WARN] ", "error":"[ERROR] "}.get(level, "[INFO] ")
+        prefix = {"info":"[信息] ", "warn":"[警告] ", "error":"[错误] "}.get(level, "[信息] ")
         self.log_edit.appendPlainText(prefix + msg)
         cursor = self.log_edit.textCursor()
         cursor.movePosition(QtGui.QTextCursor.End)
@@ -667,8 +661,7 @@ class DeformerMapperUI(QtWidgets.QDialog):
         self.reload_btn = QtWidgets.QPushButton("仅加载/重载模型");   self.reload_btn.clicked.connect(self._on_reload)
         self.export_btn = QtWidgets.QPushButton("导出当前 X/Y 样本 (.npz)"); self.export_btn.clicked.connect(self._on_export_sample_dialog)
         self.load_btn   = QtWidgets.QPushButton("载入样本并写回场景 (.npz)"); self.load_btn.clicked.connect(self._on_load_sample_dialog)
-        self.load_rand_btn = QtWidgets.QPushButton("随机载入目录样本并写回"); self.load_rand_btn.clicked.connect(self._on_load_random_dir_sample_dialog)
-        btn_h.addWidget(self.run_btn); btn_h.addWidget(self.reload_btn); btn_h.addWidget(self.export_btn); btn_h.addWidget(self.load_btn); btn_h.addWidget(self.load_rand_btn)
+        btn_h.addWidget(self.run_btn); btn_h.addWidget(self.reload_btn); btn_h.addWidget(self.export_btn); btn_h.addWidget(self.load_btn)
         dlay.addLayout(btn_h)
 
         self.tabs.addTab(deformer_tab, "Deformer Mapper")
@@ -677,7 +670,7 @@ class DeformerMapperUI(QtWidgets.QDialog):
         self.rand_tab = RandomMotionPanel(
             log_cb=self._log,
             get_nodes_cb=self._get_nodes_for_export,
-            get_sample_cb=self._get_current_sample
+            get_sample_cb=self._get_current_sample  # 本地空间样本
         )
         self.tabs.addTab(self.rand_tab, "Random Motion")
 
@@ -744,7 +737,7 @@ class DeformerMapperUI(QtWidgets.QDialog):
         use_gpu = self.use_gpu_chk.isChecked()
         return DeformerMapperSession(onnx_path, prep_path, use_gpu)
 
-    # ---- 导出/载入（单样本；本地空间） ----
+    # ---- 导出/载入（调试用的单样本；本地空间） ----
     def _on_export_sample_dialog(self):
         try:
             sample = self._get_current_sample()
@@ -753,9 +746,10 @@ class DeformerMapperUI(QtWidgets.QDialog):
             ts = time.strftime("%Y%m%d_%H%M%S")
             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存 X/Y 样本为 .npz（调试用）",
                                                             f"sample_xy_{ts}.npz", "NumPy Zip (*.npz)")
-            if not path: self._log("已取消导出。"); return
+            if not path:
+                self._log("已取消导出。"); return
             if not path.lower().endswith(".npz"): path += ".npz"
-            _save_sample_npz(path, sample)
+            self._export_sample_to_path_dict(sample, path)
             self._log(f"已导出样本（本地空间）：{path}")
         except Exception:
             self._log("导出失败：\n" + traceback.format_exc(), "error")
@@ -766,25 +760,28 @@ class DeformerMapperUI(QtWidgets.QDialog):
             if not all(inputs) or not all(outputs):
                 self._log("输入/输出节点未填满，无法载入样本。", "warn"); return
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择样本 .npz（调试用）", "", "NumPy Zip (*.npz)")
-            if not path: self._log("已取消载入。"); return
+            if not path:
+                self._log("已取消载入。"); return
 
             data = np.load(path, allow_pickle=True)
             flat_order = str(data["flatOrder"]) if "flatOrder" in data else "row"
+            print (f"Loading flatOrder for {path}: {flat_order}")
 
+            # 读取“本地”矩阵
             if "X_mats" in data:
                 Xm = np.array(data["X_mats"]); mats5_local = [Xm[:,:,i] for i in range(5)]
-            elif "X_vec60" in data:
-                mats5_local = _vec60_to_5mats(np.array(data["X_vec60"]).reshape(-1), flat_order)
+
             else:
                 raise ValueError("样本中没有 X。")
 
             if "Y_mats" in data:
+                print (f"Loading Y_mats for {path}:\n{np.array2string(np.array(data['Y_mats']), precision=6, suppress_small=True)}")
                 Ym = np.array(data["Y_mats"]); mats3_local = [Ym[:,:,i] for i in range(3)]
-            elif "Y_vec36" in data:
-                mats3_local = _unpack_output_36_to_3mats(np.array(data["Y_vec36"]).reshape(-1), flat_order)
+
             else:
                 raise ValueError("样本中没有 Y。")
 
+            # 用“当前” In1 世界矩阵还原到世界
             W1_now = _get_world_matrix(inputs[0])
             mats5_world = _from_local_to_world(mats5_local, W1_now)
             mats3_world = _from_local_to_world(mats3_local, W1_now)
@@ -792,62 +789,13 @@ class DeformerMapperUI(QtWidgets.QDialog):
             for node, M in zip(inputs, mats5_world):
                 cmds.xform(node, ws=True, m=M.reshape(-1).tolist())
             for node, M in zip(outputs, mats3_world):
+                print (f"Setting matrix for {node}:\n{np.array2string(M, formatter={'float_kind':lambda x: f'{x: .6f}'})}")
                 cmds.xform(node, ws=True, m=M.reshape(-1).tolist())
             self._log(f"已载入样本并写回（按当前 In1 为基准）：{path}")
         except Exception:
             self._log("载入失败：\n" + traceback.format_exc(), "error")
 
-    # ---- 随机载入目录里的一个 npz 并写回 ----
-    def _on_load_random_dir_sample_dialog(self):
-        try:
-            inputs, outputs = self._get_nodes_for_export()
-            if not all(inputs) or not all(outputs):
-                self._log("输入/输出节点未填满，无法载入样本。", "warn")
-                return
-
-            folder = QtWidgets.QFileDialog.getExistingDirectory(self, "选择样本所在目录", "")
-            if not folder:
-                self._log("已取消随机载入。")
-                return
-
-            files = [f for f in os.listdir(folder) if f.lower().endswith(".npz")]
-            if not files:
-                raise RuntimeError("该目录下没有 .npz 文件。")
-
-            fname = random.choice(files)
-            fpath = os.path.join(folder, fname)
-            data = np.load(fpath, allow_pickle=True)
-            flat_order = str(data["flatOrder"]) if "flatOrder" in data else "row"
-
-            if "X_mats" in data:
-                Xm = np.array(data["X_mats"]); mats5_local = [Xm[:,:,i] for i in range(5)]
-            elif "X_vec60" in data:
-                mats5_local = _vec60_to_5mats(np.array(data["X_vec60"]).reshape(-1), flat_order)
-            else:
-                raise ValueError("样本中没有 X。")
-
-            if "Y_mats" in data:
-                Ym = np.array(data["Y_mats"]); mats3_local = [Ym[:,:,i] for i in range(3)]
-            elif "Y_vec36" in data:
-                mats3_local = _unpack_output_36_to_3mats(np.array(data["Y_vec36"]).reshape(-1), flat_order)
-            else:
-                raise ValueError("样本中没有 Y。")
-
-            W1_now = _get_world_matrix(inputs[0])
-            mats5_world = _from_local_to_world(mats5_local, W1_now)
-            mats3_world = _from_local_to_world(mats3_local, W1_now)
-
-            for node, M in zip(inputs, mats5_world):
-                cmds.xform(node, ws=True, m=M.reshape(-1).tolist())
-            for node, M in zip(outputs, mats3_world):
-                cmds.xform(node, ws=True, m=M.reshape(-1).tolist())
-
-            self._log(f"已随机载入目录样本并写回：{fpath}")
-
-        except Exception:
-            self._log("随机载入目录样本失败：\n" + traceback.format_exc(), "error")
-
-    # ---- Random Motion 回调 ----
+    # ---- Random Motion 回调：获取节点 / 当前“本地空间”样本 ----
     def _get_nodes_for_export(self):
         inputs  = [e.text().strip() for e in self.inputs_edits]
         outputs = [e.text().strip() for e in self.outputs_edits]
@@ -864,11 +812,12 @@ class DeformerMapperUI(QtWidgets.QDialog):
 
         mats5_world = [_get_world_matrix(n) for n in inputs]
         mats3_world = [_get_world_matrix(n) for n in outputs]
-        mats5_local = _to_local_space(mats5_world)
-        mats3_local = _to_local_space([mats5_world[0]] + mats3_world)[1:]
 
-        X_mats = np.stack(mats5_local, axis=-1)
-        Y_mats = np.stack(mats3_local, axis=-1)
+        mats5_local = _to_local_space(mats5_world)                        # 5
+        mats3_local = _to_local_space([mats5_world[0]] + mats3_world)[1:] # 3
+
+        X_mats = np.stack(mats5_local, axis=-1)  # (4,4,5)
+        Y_mats = np.stack(mats3_local, axis=-1)  # (4,4,3)
 
         flatOrder = "row"
         X_vec60 = _pack_input_60(mats5_local, flatOrder)
@@ -879,6 +828,17 @@ class DeformerMapperUI(QtWidgets.QDialog):
             "X_vec60": X_vec60, "Y_vec36": Y_vec36,
             "flatOrder": flatOrder
         }
+
+    def _export_sample_to_path_dict(self, sample_dict: Dict, path: str):
+        flatOrder = sample_dict.get("flatOrder", "row")
+        X_mats = sample_dict["X_mats"]; Y_mats = sample_dict["Y_mats"]
+        X_vec60 = sample_dict["X_vec60"]; Y_vec36 = sample_dict["Y_vec36"]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez(path,
+                 X_mats=X_mats, Y_mats=Y_mats,
+                 X_vec60=X_vec60, Y_vec36=Y_vec36,
+                 flatOrder=flatOrder)
+        print(f"Exported y (Y_vec36) for {path}:\n{np.array2string(Y_vec36, precision=6, suppress_small=True)}")
 
 
 # ====== 入口 ======
